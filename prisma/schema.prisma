@@ -8,32 +8,37 @@ datasource db {
 }
 
 model User {
-  id               Int       @id @default(autoincrement())
-  cedula           String    @unique
+  id               Int        @id @default(autoincrement())
+  cedula           String     @unique
   nombre           String
-  correo           String    @unique
+  correo           String     @unique
   password         String
   telefono         String?
-  roleId           Int?      @map("role_id")
-  lastLoginAt      DateTime? @map("last_login_at")
-  passwordChangeAt DateTime? @map("password_change_at")
-  createdBy        Int?      @map("created_by")
-  updatedBy        Int?      @map("updated_by")
-  deletedBy        Int?      @map("deleted_by")
-  createdAt        DateTime  @default(now()) @map("created_at")
-  updatedAt        DateTime  @updatedAt @map("updated_at")
-  deletedAt        DateTime? @map("deleted_at")
-  primaryRole      Role?     @relation("UserPrimaryRole", fields: [roleId], references: [id], onDelete: SetNull)
+  lastLoginAt      DateTime?  @map("last_login_at")
+  passwordChangeAt DateTime?  @map("password_change_at")
+  createdBy        Int?       @map("created_by")
+  updatedBy        Int?       @map("updated_by")
+  deletedBy        Int?       @map("deleted_by")
+  createdAt        DateTime   @default(now()) @map("created_at")
+  updatedAt        DateTime   @updatedAt @map("updated_at")
+  deletedAt        DateTime?  @map("deleted_at")
   roles            UserRole[]
+
+  // Relaciones inversas (requeridas por Prisma)
+  ticketsCreados   Ticket[]           @relation("TicketUsuario")
+  ticketsAsignados Ticket[]           @relation("TicketAsignadoA")
+  comentarios      Comentario[]       @relation("ComentarioUsuario")
+  historialCreado  HistorialTicket[]  @relation("HistorialCreador")
+  asignacionesA    TicketAsignacion[] @relation("AsignacionUsuario")
+  asignacionesPor  TicketAsignacion[] @relation("AsignacionPor")
 }
 
 model Role {
-  id           Int              @id @default(autoincrement())
-  name         String           @unique
-  description  String?
-  users        UserRole[]
-  primaryUsers User[]           @relation("UserPrimaryRole")
-  permissions  RolePermission[]
+  id          Int              @id @default(autoincrement())
+  name        String           @unique
+  description String?
+  users       UserRole[]
+  permissions RolePermission[]
 }
 
 model Permission {
@@ -48,12 +53,12 @@ model Permission {
 }
 
 model UserRole {
-  id        Int      @id @default(autoincrement())
-  userId    Int
-  roleId    Int
+  id         Int      @id @default(autoincrement())
+  userId     Int
+  roleId     Int
   assignedAt DateTime @default(now())
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  role      Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role       Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
 
   @@unique([userId, roleId])
 }
@@ -70,3 +75,182 @@ model RolePermission {
   @@map("RolePermisos")
 }
 
+// =========================
+// CATALOGOS
+// =========================
+
+model Categoria {
+  id          Int     @id @default(autoincrement())
+  nombre      String
+  descripcion String?
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+  createdBy Int?      @map("created_by")
+  updatedBy Int?      @map("updated_by")
+  deletedBy Int?      @map("deleted_by")
+
+  subcategorias Subcategoria[]
+  tickets       Ticket[]       @relation("TicketCategoria")
+
+  @@map("categorias")
+}
+
+model Subcategoria {
+  id          Int     @id @default(autoincrement())
+  categoriaId Int     @map("categoria_id")
+  nombre      String
+  descripcion String?
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+  createdBy Int?      @map("created_by")
+  updatedBy Int?      @map("updated_by")
+  deletedBy Int?      @map("deleted_by")
+
+  categoria Categoria @relation(fields: [categoriaId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  tickets   Ticket[]  @relation("TicketSubcategoria")
+
+  @@map("subcategorias")
+}
+
+model Prioridad {
+  id     Int    @id @default(autoincrement())
+  nombre String
+  nivel  Int
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+  createdBy Int?      @map("created_by")
+  updatedBy Int?      @map("updated_by")
+  deletedBy Int?      @map("deleted_by")
+
+  tickets Ticket[]
+
+  @@map("prioridades")
+}
+
+model Estado {
+  id     Int    @id @default(autoincrement())
+  nombre String
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+  createdBy Int?      @map("created_by")
+  updatedBy Int?      @map("updated_by")
+  deletedBy Int?      @map("deleted_by")
+
+  tickets Ticket[]
+
+  @@map("estados")
+}
+
+// =========================
+// TICKETS
+// =========================
+
+model Ticket {
+  id          Int     @id @default(autoincrement())
+  codigo      String  @unique
+  titulo      String
+  descripcion String? @db.Text
+
+  userId         Int  @map("user_id")
+  categoriaId    Int  @map("categoria_id")
+  subcategoriaId Int  @map("subcategoria_id")
+  prioridadId    Int  @map("prioridad_id")
+  estadoId       Int  @map("estado_id")
+  assignedToId   Int? @map("assigned_to")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+  createdBy Int?      @map("created_by")
+  updatedBy Int?      @map("updated_by")
+  deletedBy Int?      @map("deleted_by")
+
+  user         User         @relation("TicketUsuario", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  assignedTo   User?        @relation("TicketAsignadoA", fields: [assignedToId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  categoria    Categoria    @relation("TicketCategoria", fields: [categoriaId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  subcategoria Subcategoria @relation("TicketSubcategoria", fields: [subcategoriaId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  prioridad    Prioridad    @relation(fields: [prioridadId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  estado       Estado       @relation(fields: [estadoId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  comentarios  Comentario[]
+  historial    HistorialTicket[]
+  asignaciones TicketAsignacion[]
+
+  @@map("tickets")
+}
+
+// =========================
+// COMENTARIOS
+// =========================
+
+model Comentario {
+  id         Int     @id @default(autoincrement())
+  ticketId   Int     @map("ticket_id")
+  userId     Int     @map("user_id")
+  comentario String? @db.Text
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+  createdBy Int?      @map("created_by")
+  updatedBy Int?      @map("updated_by")
+  deletedBy Int?      @map("deleted_by")
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  user   User   @relation("ComentarioUsuario", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@map("comentarios")
+}
+
+// =========================
+// HISTORIAL
+// =========================
+
+model HistorialTicket {
+  id            Int     @id @default(autoincrement())
+  ticketId      Int     @map("ticket_id")
+  accion        String
+  descripcion   String? @db.Text
+  valorAnterior String? @map("valor_anterior")
+  valorNuevo    String? @map("valor_nuevo")
+
+  createdBy Int @map("created_by")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+  updatedBy Int?      @map("updated_by")
+  deletedBy Int?      @map("deleted_by")
+
+  ticket  Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  creador User   @relation("HistorialCreador", fields: [createdBy], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@map("historial_tickets")
+}
+
+// =========================
+// ASIGNACIONES
+// =========================
+
+model TicketAsignacion {
+  id          Int      @id @default(autoincrement())
+  ticketId    Int      @map("ticket_id")
+  userId      Int      @map("user_id")
+  asignadoPor Int      @map("asignado_por")
+  esActual    Boolean  @map("es_actual")
+  asignadoEn  DateTime @map("asignado_en")
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  user   User   @relation("AsignacionUsuario", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  por    User   @relation("AsignacionPor", fields: [asignadoPor], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@map("ticket_asignaciones")
+}

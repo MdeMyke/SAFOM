@@ -5,6 +5,17 @@ import { PrismaService } from '../../prisma/prisma.service';
 export class RbacService {
   constructor(private readonly prisma: PrismaService) {}
 
+  async findRoles() {
+    return this.prisma.role.findMany({
+      select: {
+        id: true,
+        name: true,
+        description: true,
+      },
+      orderBy: { name: 'asc' },
+    });
+  }
+
   async getPermissionsByUserId(userId: number): Promise<string[]> {
     const rows = await this.prisma.userRole.findMany({
       where: { userId },
