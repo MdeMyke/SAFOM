@@ -63,6 +63,21 @@ async function main() {
     }
   }
 
+  const estadosSeed = [
+    { nombre: 'abierto' },
+    { nombre: 'en_progreso' },
+    { nombre: 'pendiente' },
+    { nombre: 'resuelto' },
+    { nombre: 'cerrado' },
+  ];
+
+  for (const item of estadosSeed) {
+    const exists = await prisma.estado.findFirst({ where: { nombre: item.nombre } });
+    if (!exists) {
+      await prisma.estado.create({ data: item });
+    }
+  }
+
   const categoriasSeed = [
     { nombre: 'Soporte', descripcion: 'Soporte funcional y técnico' },
     { nombre: 'Desarrollo', descripcion: 'Requerimientos y ajustes de desarrollo' },
