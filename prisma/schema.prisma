@@ -168,6 +168,7 @@ model Ticket {
 
   createdAt DateTime  @default(now()) @map("created_at")
   updatedAt DateTime  @updatedAt @map("updated_at")
+  archivadoAt DateTime? @map("archivado_at")
   deletedAt DateTime? @map("deleted_at")
   createdBy Int?      @map("created_by")
   updatedBy Int?      @map("updated_by")
