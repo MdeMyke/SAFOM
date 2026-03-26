@@ -136,6 +136,13 @@ model Prioridad {
 model Estado {
   id     Int    @id @default(autoincrement())
   nombre String
+  // Catalogo esperado:
+  // 1. abierto
+  // 2. asignado
+  // 3. en_progreso
+  // 4. pendiente_aprobacion
+  // 5. resuelto
+  // 6. cerrado
 
   createdAt DateTime  @default(now()) @map("created_at")
   updatedAt DateTime  @updatedAt @map("updated_at")
@@ -159,7 +166,7 @@ model Ticket {
   titulo      String
   descripcion String? @db.Text
 
-  userId         Int  @map("user_id")
+  solicitanteUserId Int  @map("solicitante_user_id")
   categoriaId    Int  @map("categoria_id")
   subcategoriaId Int  @map("subcategoria_id")
   prioridadId    Int  @map("prioridad_id")
@@ -174,7 +181,7 @@ model Ticket {
   updatedBy Int?      @map("updated_by")
   deletedBy Int?      @map("deleted_by")
 
-  user         User         @relation("TicketUsuario", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  user         User         @relation("TicketUsuario", fields: [solicitanteUserId], references: [id], onDelete: Restrict, onUpdate: Cascade)
   assignedTo   User?        @relation("TicketAsignadoA", fields: [assignedToId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   categoria    Categoria    @relation("TicketCategoria", fields: [categoriaId], references: [id], onDelete: Restrict, onUpdate: Cascade)
   subcategoria Subcategoria @relation("TicketSubcategoria", fields: [subcategoriaId], references: [id], onDelete: Restrict, onUpdate: Cascade)

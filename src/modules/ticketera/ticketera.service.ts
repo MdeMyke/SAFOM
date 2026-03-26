@@ -22,6 +22,7 @@ export class TicketeraService {
 
     return tickets.map((t) => ({
       id: t.id,
+      userId: t.solicitanteUserId,
       codigo: t.codigo,
       titulo: t.titulo,
       descripcion: t.descripcion ?? '',
@@ -69,31 +70,18 @@ export class TicketeraService {
           codigo,
           titulo,
           descripcion: dto.descripcion?.trim() || null,
-          userId,
+          solicitanteUserId: userId,
           categoriaId: dto.categoriaId,
           subcategoriaId: dto.subcategoriaId,
           prioridadId: dto.prioridadId,
           estadoId: estadoId!,
           // El ticket se crea sin usuario asignado por defecto.
-          assignedToId: dto.userId ?? null,
+          assignedToId: null,
           createdBy: userId,
           updatedBy: userId,
         },
         select: { id: true },
       });
-
-      // Solo registra trazabilidad inicial cuando llega una asignacion explicita.
-      if (dto.userId) {
-        await tx.ticketAsignacion.create({
-          data: {
-            ticketId: created.id,
-            userId: dto.userId,
-            asignadoPor: userId,
-            esActual: true,
-            asignadoEn: new Date(),
-          },
-        });
-      }
 
       return tx.ticket.findUniqueOrThrow({
         where: { id: created.id },
@@ -109,6 +97,7 @@ export class TicketeraService {
 
       return {
         id: ticket.id,
+        userId: ticket.solicitanteUserId,
         codigo: ticket.codigo,
         titulo: ticket.titulo,
       descripcion: ticket.descripcion ?? '',
@@ -186,6 +175,7 @@ export class TicketeraService {
 
     return {
       id: updated.id,
+      userId: updated.solicitanteUserId,
       codigo: updated.codigo,
       titulo: updated.titulo,
       descripcion: updated.descripcion ?? '',

@@ -65,8 +65,9 @@ async function main() {
 
   const estadosSeed = [
     { nombre: 'abierto' },
+    { nombre: 'asignado' },
     { nombre: 'en_progreso' },
-    { nombre: 'pendiente' },
+    { nombre: 'pendiente_aprobacion' },
     { nombre: 'resuelto' },
     { nombre: 'cerrado' },
   ];
