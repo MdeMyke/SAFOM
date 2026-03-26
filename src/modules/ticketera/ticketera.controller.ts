@@ -1,5 +1,6 @@
-import { Body, Controller, Get, Post } from '@nestjs/common';
+import { Body, Controller, Get, Param, ParseIntPipe, Post } from '@nestjs/common';
 import { CreateTicketDto } from './dto/create-ticket.dto';
+import { AssignTicketDto } from './dto/assign-ticket.dto';
 import { TicketeraService } from './ticketera.service';
 
 @Controller()
@@ -14,6 +15,14 @@ export class TicketeraController {
   @Post('tickets')
   createTicket(@Body() dto: CreateTicketDto) {
     return this.ticketeraService.createTicket(dto);
+  }
+
+  @Post('tickets/:ticketId/assign')
+  assignTicket(
+    @Param('ticketId', ParseIntPipe) ticketId: number,
+    @Body() dto: AssignTicketDto,
+  ) {
+    return this.ticketeraService.assignTicket(ticketId, dto);
   }
 
   @Get('categorias')

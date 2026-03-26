@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CreateTicketDto } from './dto/create-ticket.dto';
+import { AssignTicketDto } from './dto/assign-ticket.dto';
 
 @Injectable()
 export class TicketeraService {
@@ -13,6 +14,8 @@ export class TicketeraService {
         estado: true,
         prioridad: true,
         assignedTo: true,
+        categoria: true,
+        subcategoria: true,
       },
       orderBy: { createdAt: 'desc' },
     });
@@ -21,9 +24,14 @@ export class TicketeraService {
       id: t.id,
       codigo: t.codigo,
       titulo: t.titulo,
+      descripcion: t.descripcion ?? '',
       estado: t.estado?.nombre ?? '',
       prioridad: t.prioridad?.nombre ?? '',
+      prioridadNivel: t.prioridad?.nivel ?? null,
       asignadoA: t.assignedTo ? t.assignedTo.nombre : 'Sin asignar',
+      categoriaId: t.categoriaId,
+      categoriaNombre: t.categoria?.nombre ?? '',
+      subcategoriaNombre: t.subcategoria?.nombre ?? '',
       updatedAt: t.updatedAt,
     }));
   }
@@ -54,35 +62,141 @@ export class TicketeraService {
 
     const userId = dto.userId ?? (await this.resolveDefaultUserId());
     const codigo = this.generateTicketCode();
-    const ticket = await this.prisma.ticket.create({
-      data: {
-        codigo,
-        titulo,
-        descripcion: dto.descripcion?.trim() || null,
-        userId,
-        categoriaId: dto.categoriaId,
-        subcategoriaId: dto.subcategoriaId,
-        prioridadId: dto.prioridadId,
-        estadoId: estadoId!,
-        assignedToId: null,
-        createdBy: userId,
-        updatedBy: userId,
-      },
+
+    const ticket = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.ticket.create({
+        data: {
+          codigo,
+          titulo,
+          descripcion: dto.descripcion?.trim() || null,
+          userId,
+          categoriaId: dto.categoriaId,
+          subcategoriaId: dto.subcategoriaId,
+          prioridadId: dto.prioridadId,
+          estadoId: estadoId!,
+          // El ticket se crea sin usuario asignado por defecto.
+          assignedToId: dto.userId ?? null,
+          createdBy: userId,
+          updatedBy: userId,
+        },
+        select: { id: true },
+      });
+
+      // Solo registra trazabilidad inicial cuando llega una asignacion explicita.
+      if (dto.userId) {
+        await tx.ticketAsignacion.create({
+          data: {
+            ticketId: created.id,
+            userId: dto.userId,
+            asignadoPor: userId,
+            esActual: true,
+            asignadoEn: new Date(),
+          },
+        });
+      }
+
+      return tx.ticket.findUniqueOrThrow({
+        where: { id: created.id },
+        include: {
+          estado: true,
+          prioridad: true,
+          assignedTo: true,
+          categoria: true,
+          subcategoria: true,
+        },
+      });
+      });
+
+      return {
+        id: ticket.id,
+        codigo: ticket.codigo,
+        titulo: ticket.titulo,
+      descripcion: ticket.descripcion ?? '',
+        estado: ticket.estado?.nombre ?? '',
+        prioridad: ticket.prioridad?.nombre ?? '',
+      prioridadNivel: ticket.prioridad?.nivel ?? null,
+        asignadoA: ticket.assignedTo ? ticket.assignedTo.nombre : 'Sin asignar',
+      categoriaId: ticket.categoriaId,
+      categoriaNombre: ticket.categoria?.nombre ?? '',
+      subcategoriaNombre: ticket.subcategoria?.nombre ?? '',
+        updatedAt: ticket.updatedAt,
+      };
+  }
+
+  async assignTicket(ticketId: number, dto: AssignTicketDto) {
+    const ticket = await this.prisma.ticket.findFirst({
+      where: { id: ticketId, deletedAt: null },
       include: {
         estado: true,
         prioridad: true,
         assignedTo: true,
+        categoria: true,
+        subcategoria: true,
       },
     });
 
+    if (!ticket) {
+      throw new NotFoundException('Ticket no encontrado');
+    }
+
+    const targetUser = await this.prisma.user.findFirst({
+      where: { id: dto.userId, deletedAt: null },
+      select: { id: true },
+    });
+
+    if (!targetUser) {
+      throw new NotFoundException('Usuario no encontrado');
+    }
+
+    const assignedBy = await this.resolveDefaultUserId();
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      await tx.ticketAsignacion.updateMany({
+        where: { ticketId, esActual: true },
+        data: { esActual: false },
+      });
+
+      await tx.ticketAsignacion.create({
+        data: {
+          ticketId,
+          userId: targetUser.id,
+          asignadoPor: assignedBy,
+          esActual: true,
+          asignadoEn: new Date(),
+        },
+      });
+
+      const updatedTicket = await tx.ticket.update({
+        where: { id: ticketId },
+        data: {
+          assignedToId: targetUser.id,
+          updatedBy: assignedBy,
+        },
+        include: {
+          estado: true,
+          prioridad: true,
+          assignedTo: true,
+          categoria: true,
+          subcategoria: true,
+        },
+      });
+
+      return updatedTicket;
+    });
+
     return {
-      id: ticket.id,
-      codigo: ticket.codigo,
-      titulo: ticket.titulo,
-      estado: ticket.estado?.nombre ?? '',
-      prioridad: ticket.prioridad?.nombre ?? '',
-      asignadoA: ticket.assignedTo ? ticket.assignedTo.nombre : 'Sin asignar',
-      updatedAt: ticket.updatedAt,
+      id: updated.id,
+      codigo: updated.codigo,
+      titulo: updated.titulo,
+      descripcion: updated.descripcion ?? '',
+      estado: updated.estado?.nombre ?? '',
+      prioridad: updated.prioridad?.nombre ?? '',
+      prioridadNivel: updated.prioridad?.nivel ?? null,
+      asignadoA: updated.assignedTo ? updated.assignedTo.nombre : 'Sin asignar',
+      categoriaId: updated.categoriaId,
+      categoriaNombre: updated.categoria?.nombre ?? '',
+      subcategoriaNombre: updated.subcategoria?.nombre ?? '',
+      updatedAt: updated.updatedAt,
     };
   }
 
