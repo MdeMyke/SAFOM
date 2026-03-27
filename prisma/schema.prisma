@@ -26,11 +26,11 @@ model User {
 
   // Relaciones inversas (requeridas por Prisma)
   ticketsCreados   Ticket[]           @relation("TicketUsuario")
-  ticketsAsignados Ticket[]           @relation("TicketAsignadoA")
   comentarios      Comentario[]       @relation("ComentarioUsuario")
   historialCreado  HistorialTicket[]  @relation("HistorialCreador")
   asignacionesA    TicketAsignacion[] @relation("AsignacionUsuario")
   asignacionesPor  TicketAsignacion[] @relation("AsignacionPor")
+  ticketsArchivados Ticket[]          @relation("TicketArchivadoPor")
 }
 
 model Role {
@@ -171,18 +171,18 @@ model Ticket {
   subcategoriaId Int  @map("subcategoria_id")
   prioridadId    Int  @map("prioridad_id")
   estadoId       Int  @map("estado_id")
-  assignedToId   Int? @map("assigned_to")
 
   createdAt DateTime  @default(now()) @map("created_at")
   updatedAt DateTime  @updatedAt @map("updated_at")
   archivadoAt DateTime? @map("archivado_at")
+  archivadoBy Int?      @map("archivado_by")
   deletedAt DateTime? @map("deleted_at")
   createdBy Int?      @map("created_by")
   updatedBy Int?      @map("updated_by")
   deletedBy Int?      @map("deleted_by")
 
   user         User         @relation("TicketUsuario", fields: [solicitanteUserId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  assignedTo   User?        @relation("TicketAsignadoA", fields: [assignedToId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  archivadoPor User?        @relation("TicketArchivadoPor", fields: [archivadoBy], references: [id], onDelete: SetNull, onUpdate: Cascade)
   categoria    Categoria    @relation("TicketCategoria", fields: [categoriaId], references: [id], onDelete: Restrict, onUpdate: Cascade)
   subcategoria Subcategoria @relation("TicketSubcategoria", fields: [subcategoriaId], references: [id], onDelete: Restrict, onUpdate: Cascade)
   prioridad    Prioridad    @relation(fields: [prioridadId], references: [id], onDelete: Restrict, onUpdate: Cascade)
@@ -227,8 +227,8 @@ model HistorialTicket {
   ticketId      Int     @map("ticket_id")
   accion        String
   descripcion   String? @db.Text
-  valorAnterior String? @map("valor_anterior")
-  valorNuevo    String? @map("valor_nuevo")
+  valorAnterior Json?   @map("valor_anterior") @db.Json
+  valorNuevo    Json?   @map("valor_nuevo") @db.Json
 
   createdBy Int @map("created_by")
 

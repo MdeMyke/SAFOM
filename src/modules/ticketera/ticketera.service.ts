@@ -7,15 +7,22 @@ import { AssignTicketDto } from './dto/assign-ticket.dto';
 export class TicketeraService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async findTickets() {
+  async findTickets(params?: { archived?: boolean }) {
+    const archived = params?.archived;
+    const archivadoAtFilter =
+      archived === true ? { not: null as any } : archived === false ? null : undefined;
+
     const tickets = await this.prisma.ticket.findMany({
-      where: { deletedAt: null },
+      where: { deletedAt: null, archivadoAt: archivadoAtFilter },
       include: {
         estado: true,
         prioridad: true,
-        assignedTo: true,
         categoria: true,
         subcategoria: true,
+        asignaciones: {
+          where: { esActual: true },
+          include: { user: true },
+        },
       },
       orderBy: { createdAt: 'desc' },
     });
@@ -29,12 +36,166 @@ export class TicketeraService {
       estado: t.estado?.nombre ?? '',
       prioridad: t.prioridad?.nombre ?? '',
       prioridadNivel: t.prioridad?.nivel ?? null,
-      asignadoA: t.assignedTo ? t.assignedTo.nombre : 'Sin asignar',
+      asignadoA: t.asignaciones?.[0]?.user?.nombre ?? 'Sin asignar',
       categoriaId: t.categoriaId,
       categoriaNombre: t.categoria?.nombre ?? '',
       subcategoriaNombre: t.subcategoria?.nombre ?? '',
       updatedAt: t.updatedAt,
     }));
+  }
+
+  async archiveTicket(ticketId: number) {
+    const existing = await this.prisma.ticket.findFirst({
+      where: { id: ticketId, deletedAt: null },
+      // `archivadoBy` puede no existir en los tipos si Prisma Client no está regenerado aún.
+      // Lo leemos vía `any` más abajo cuando construimos el historial.
+      select: { id: true, archivadoAt: true } as any,
+    });
+    if (!existing) {
+      throw new NotFoundException('Ticket no encontrado');
+    }
+    if (existing.archivadoAt) {
+      throw new BadRequestException('El ticket ya está archivado');
+    }
+
+    const archivedBy = await this.resolveDefaultUserId();
+    const archivedAt = new Date();
+
+    const valorAnterior = {
+      archivado_at: existing.archivadoAt ?? null,
+      archivado_by: (existing as any).archivadoBy ?? null,
+    } as any;
+    const valorNuevo = {
+      archivado_at: archivedAt.toISOString(),
+      archivado_by: archivedBy,
+    } as any;
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      // Nota: si Prisma Client no está regenerado aún, `archivadoBy` no existe en los tipos.
+      // Esto mantiene la compatibilidad hasta que se ejecute `npm run prisma:generate`.
+      const archived = (await (tx.ticket.update as any)({
+        where: { id: ticketId },
+        data: {
+          archivadoAt: archivedAt,
+          archivadoBy: archivedBy,
+          updatedBy: archivedBy,
+        },
+        include: {
+          estado: true,
+          prioridad: true,
+          categoria: true,
+          subcategoria: true,
+          asignaciones: {
+            where: { esActual: true },
+            include: { user: true },
+          },
+        },
+      })) as any;
+
+      await tx.historialTicket.create({
+        data: {
+          ticketId,
+          accion: 'archivo',
+          descripcion: 'Ticket archivado',
+          // Nota: estos campos son Json? en schema.prisma, pero si Prisma Client
+          // aún no se regeneró, los tipos TS pueden seguir viéndolos como string.
+          valorAnterior: valorAnterior as any,
+          valorNuevo: valorNuevo as any,
+          createdBy: archivedBy,
+        },
+      });
+
+      return archived;
+    });
+
+    return {
+      id: updated.id,
+      userId: updated.solicitanteUserId,
+      codigo: updated.codigo,
+      titulo: updated.titulo,
+      descripcion: updated.descripcion ?? '',
+      estado: updated.estado?.nombre ?? '',
+      prioridad: updated.prioridad?.nombre ?? '',
+      prioridadNivel: updated.prioridad?.nivel ?? null,
+      asignadoA: updated.asignaciones?.[0]?.user?.nombre ?? 'Sin asignar',
+      categoriaId: updated.categoriaId,
+      categoriaNombre: updated.categoria?.nombre ?? '',
+      subcategoriaNombre: updated.subcategoria?.nombre ?? '',
+      updatedAt: updated.updatedAt,
+    };
+  }
+
+  async unarchiveTicket(ticketId: number) {
+    const existing = await this.prisma.ticket.findFirst({
+      where: { id: ticketId, deletedAt: null },
+      select: { id: true, archivadoAt: true } as any,
+    });
+    if (!existing) {
+      throw new NotFoundException('Ticket no encontrado');
+    }
+    if (!existing.archivadoAt) {
+      throw new BadRequestException('El ticket no está archivado');
+    }
+
+    const unarchivedBy = await this.resolveDefaultUserId();
+    const valorAnterior = {
+      archivado_at: existing.archivadoAt ? new Date(existing.archivadoAt as any).toISOString() : null,
+      archivado_by: (existing as any).archivadoBy ?? null,
+    } as any;
+    const valorNuevo = {
+      archivado_at: null,
+      archivado_by: null,
+    } as any;
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const unarchived = (await (tx.ticket.update as any)({
+        where: { id: ticketId },
+        data: {
+          archivadoAt: null,
+          archivadoBy: null,
+          updatedBy: unarchivedBy,
+        },
+        include: {
+          estado: true,
+          prioridad: true,
+          categoria: true,
+          subcategoria: true,
+          asignaciones: {
+            where: { esActual: true },
+            include: { user: true },
+          },
+        },
+      })) as any;
+
+      await tx.historialTicket.create({
+        data: {
+          ticketId,
+          accion: 'desarchivo',
+          descripcion: 'Ticket desarchivado',
+          valorAnterior: valorAnterior as any,
+          valorNuevo: valorNuevo as any,
+          createdBy: unarchivedBy,
+        },
+      });
+
+      return unarchived;
+    });
+
+    return {
+      id: updated.id,
+      userId: updated.solicitanteUserId,
+      codigo: updated.codigo,
+      titulo: updated.titulo,
+      descripcion: updated.descripcion ?? '',
+      estado: updated.estado?.nombre ?? '',
+      prioridad: updated.prioridad?.nombre ?? '',
+      prioridadNivel: updated.prioridad?.nivel ?? null,
+      asignadoA: updated.asignaciones?.[0]?.user?.nombre ?? 'Sin asignar',
+      categoriaId: updated.categoriaId,
+      categoriaNombre: updated.categoria?.nombre ?? '',
+      subcategoriaNombre: updated.subcategoria?.nombre ?? '',
+      updatedAt: updated.updatedAt,
+    };
   }
 
   async createTicket(dto: CreateTicketDto) {
@@ -75,8 +236,6 @@ export class TicketeraService {
           subcategoriaId: dto.subcategoriaId,
           prioridadId: dto.prioridadId,
           estadoId: estadoId!,
-          // El ticket se crea sin usuario asignado por defecto.
-          assignedToId: null,
           createdBy: userId,
           updatedBy: userId,
         },
@@ -88,9 +247,12 @@ export class TicketeraService {
         include: {
           estado: true,
           prioridad: true,
-          assignedTo: true,
           categoria: true,
           subcategoria: true,
+          asignaciones: {
+            where: { esActual: true },
+            include: { user: true },
+          },
         },
       });
       });
@@ -104,7 +266,7 @@ export class TicketeraService {
         estado: ticket.estado?.nombre ?? '',
         prioridad: ticket.prioridad?.nombre ?? '',
       prioridadNivel: ticket.prioridad?.nivel ?? null,
-        asignadoA: ticket.assignedTo ? ticket.assignedTo.nombre : 'Sin asignar',
+        asignadoA: ticket.asignaciones?.[0]?.user?.nombre ?? 'Sin asignar',
       categoriaId: ticket.categoriaId,
       categoriaNombre: ticket.categoria?.nombre ?? '',
       subcategoriaNombre: ticket.subcategoria?.nombre ?? '',
@@ -118,9 +280,12 @@ export class TicketeraService {
       include: {
         estado: true,
         prioridad: true,
-        assignedTo: true,
         categoria: true,
         subcategoria: true,
+        asignaciones: {
+          where: { esActual: true },
+          include: { user: true },
+        },
       },
     });
 
@@ -158,15 +323,17 @@ export class TicketeraService {
       const updatedTicket = await tx.ticket.update({
         where: { id: ticketId },
         data: {
-          assignedToId: targetUser.id,
           updatedBy: assignedBy,
         },
         include: {
           estado: true,
           prioridad: true,
-          assignedTo: true,
           categoria: true,
           subcategoria: true,
+          asignaciones: {
+            where: { esActual: true },
+            include: { user: true },
+          },
         },
       });
 
@@ -182,7 +349,7 @@ export class TicketeraService {
       estado: updated.estado?.nombre ?? '',
       prioridad: updated.prioridad?.nombre ?? '',
       prioridadNivel: updated.prioridad?.nivel ?? null,
-      asignadoA: updated.assignedTo ? updated.assignedTo.nombre : 'Sin asignar',
+      asignadoA: updated.asignaciones?.[0]?.user?.nombre ?? 'Sin asignar',
       categoriaId: updated.categoriaId,
       categoriaNombre: updated.categoria?.nombre ?? '',
       subcategoriaNombre: updated.subcategoria?.nombre ?? '',
