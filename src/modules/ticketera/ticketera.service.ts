@@ -2,6 +2,7 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { PrismaService } from '../../prisma/prisma.service';
 import { CreateTicketDto } from './dto/create-ticket.dto';
 import { AssignTicketDto } from './dto/assign-ticket.dto';
+import { RedirectTicketDto } from './dto/redirect-ticket.dto';
 
 @Injectable()
 export class TicketeraService {
@@ -38,10 +39,106 @@ export class TicketeraService {
       prioridadNivel: t.prioridad?.nivel ?? null,
       asignadoA: t.asignaciones?.[0]?.user?.nombre ?? 'Sin asignar',
       categoriaId: t.categoriaId,
+      subcategoriaId: t.subcategoriaId,
       categoriaNombre: t.categoria?.nombre ?? '',
       subcategoriaNombre: t.subcategoria?.nombre ?? '',
       updatedAt: t.updatedAt,
     }));
+  }
+
+  async redirectTicket(ticketId: number, dto: RedirectTicketDto) {
+    const motivo = dto.motivo?.trim();
+    if (!motivo || motivo.length < 3) {
+      throw new BadRequestException('El motivo es requerido');
+    }
+
+    const existing = await this.prisma.ticket.findFirst({
+      where: { id: ticketId, deletedAt: null },
+      select: {
+        id: true,
+        categoriaId: true,
+        subcategoriaId: true,
+      },
+    });
+    if (!existing) throw new NotFoundException('Ticket no encontrado');
+
+    const categoria = await this.prisma.categoria.findFirst({
+      where: { id: dto.categoriaId, deletedAt: null },
+      select: { id: true, nombre: true },
+    });
+    if (!categoria) throw new NotFoundException('Categoría no encontrada');
+
+    const subcategoria = await this.prisma.subcategoria.findFirst({
+      where: { id: dto.subcategoriaId, deletedAt: null },
+      select: { id: true, nombre: true, categoriaId: true },
+    });
+    if (!subcategoria) throw new NotFoundException('Subcategoría no encontrada');
+    if (subcategoria.categoriaId !== categoria.id) {
+      throw new BadRequestException('La subcategoría no pertenece a la categoría seleccionada');
+    }
+
+    const actorId = await this.resolveDefaultUserId();
+
+    const valorAnterior = {
+      categoria_id: existing.categoriaId,
+      subcategoria_id: existing.subcategoriaId,
+    } as any;
+    const valorNuevo = {
+      categoria_id: categoria.id,
+      subcategoria_id: subcategoria.id,
+      motivo,
+    } as any;
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const ticket = await tx.ticket.update({
+        where: { id: ticketId },
+        data: {
+          categoriaId: categoria.id,
+          subcategoriaId: subcategoria.id,
+          updatedBy: actorId,
+        },
+        include: {
+          estado: true,
+          prioridad: true,
+          categoria: true,
+          subcategoria: true,
+          asignaciones: {
+            where: { esActual: true },
+            include: { user: true },
+          },
+        },
+      });
+
+      await tx.historialTicket.create({
+        data: {
+          ticketId,
+          accion: 'redireccionamiento',
+          descripcion: motivo,
+          valorAnterior: valorAnterior as any,
+          valorNuevo: valorNuevo as any,
+          createdBy: actorId,
+        },
+      });
+
+      return ticket;
+    });
+
+    return {
+      id: updated.id,
+      userId: updated.solicitanteUserId,
+      codigo: updated.codigo,
+      titulo: updated.titulo,
+      descripcion: updated.descripcion ?? '',
+      estado: updated.estado?.nombre ?? '',
+      prioridad: updated.prioridad?.nombre ?? '',
+      prioridadNivel: updated.prioridad?.nivel ?? null,
+      asignadoA: updated.asignaciones?.[0]?.user?.nombre ?? 'Sin asignar',
+      categoriaId: updated.categoriaId,
+      subcategoriaId: updated.subcategoriaId,
+      categoriaNombre: updated.categoria?.nombre ?? '',
+      subcategoriaNombre: updated.subcategoria?.nombre ?? '',
+      updatedAt: updated.updatedAt,
+    };
   }
 
   async archiveTicket(ticketId: number) {
@@ -119,6 +216,7 @@ export class TicketeraService {
       prioridadNivel: updated.prioridad?.nivel ?? null,
       asignadoA: updated.asignaciones?.[0]?.user?.nombre ?? 'Sin asignar',
       categoriaId: updated.categoriaId,
+      subcategoriaId: updated.subcategoriaId,
       categoriaNombre: updated.categoria?.nombre ?? '',
       subcategoriaNombre: updated.subcategoria?.nombre ?? '',
       updatedAt: updated.updatedAt,
@@ -192,6 +290,7 @@ export class TicketeraService {
       prioridadNivel: updated.prioridad?.nivel ?? null,
       asignadoA: updated.asignaciones?.[0]?.user?.nombre ?? 'Sin asignar',
       categoriaId: updated.categoriaId,
+      subcategoriaId: updated.subcategoriaId,
       categoriaNombre: updated.categoria?.nombre ?? '',
       subcategoriaNombre: updated.subcategoria?.nombre ?? '',
       updatedAt: updated.updatedAt,
@@ -268,6 +367,7 @@ export class TicketeraService {
       prioridadNivel: ticket.prioridad?.nivel ?? null,
         asignadoA: ticket.asignaciones?.[0]?.user?.nombre ?? 'Sin asignar',
       categoriaId: ticket.categoriaId,
+      subcategoriaId: ticket.subcategoriaId,
       categoriaNombre: ticket.categoria?.nombre ?? '',
       subcategoriaNombre: ticket.subcategoria?.nombre ?? '',
         updatedAt: ticket.updatedAt,
@@ -351,6 +451,7 @@ export class TicketeraService {
       prioridadNivel: updated.prioridad?.nivel ?? null,
       asignadoA: updated.asignaciones?.[0]?.user?.nombre ?? 'Sin asignar',
       categoriaId: updated.categoriaId,
+      subcategoriaId: updated.subcategoriaId,
       categoriaNombre: updated.categoria?.nombre ?? '',
       subcategoriaNombre: updated.subcategoria?.nombre ?? '',
       updatedAt: updated.updatedAt,

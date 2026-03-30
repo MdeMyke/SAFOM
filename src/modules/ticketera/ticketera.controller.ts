@@ -2,6 +2,7 @@ import { Body, Controller, Get, Param, ParseIntPipe, Patch, Post, Query, UseGuar
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CreateTicketDto } from './dto/create-ticket.dto';
 import { AssignTicketDto } from './dto/assign-ticket.dto';
+import { RedirectTicketDto } from './dto/redirect-ticket.dto';
 import { TicketeraService } from './ticketera.service';
 
 @Controller()
@@ -36,6 +37,14 @@ export class TicketeraController {
   @Patch('tickets/:ticketId/unarchive')
   unarchiveTicket(@Param('ticketId', ParseIntPipe) ticketId: number) {
     return this.ticketeraService.unarchiveTicket(ticketId);
+  }
+
+  @Patch('tickets/:ticketId/redirect')
+  redirectTicket(
+    @Param('ticketId', ParseIntPipe) ticketId: number,
+    @Body() dto: RedirectTicketDto,
+  ) {
+    return this.ticketeraService.redirectTicket(ticketId, dto);
   }
 
   @Get('categorias')

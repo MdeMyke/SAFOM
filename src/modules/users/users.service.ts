@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
+import * as bcrypt from 'bcrypt';
 
 @Injectable()
 export class UsersService {
@@ -97,13 +98,17 @@ export class UsersService {
     const roleIds = roleRows.map((role) => role.id);
 
     try {
+      const rawPassword = (dto.password && dto.password.trim()) ? dto.password : dto.cedula;
+      const passwordHash = await bcrypt.hash(rawPassword, 10);
+
       const user = await this.prisma.user.create({
         data: {
           cedula: dto.cedula,
           nombre: dto.nombre,
-          correo: dto.correo,
+          correo: dto.correo.trim().toLowerCase(),
           telefono: dto.telefono ?? null,
-          password: dto.password ?? 'cambiar123',
+          password: passwordHash,
+          passwordChangeAt: new Date(),
           roles: {
             create: roleIds.map((roleId) => ({
               roleId,
