@@ -1,7 +1,9 @@
-import { Controller, Get } from '@nestjs/common';
+import { Controller, Get, UseGuards } from '@nestjs/common';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RbacService } from './rbac.service';
 
 @Controller('roles')
+@UseGuards(JwtAuthGuard)
 export class RbacController {
   constructor(private readonly rbacService: RbacService) {}
 

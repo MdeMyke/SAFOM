@@ -1,5 +1,6 @@
 import { Controller, Get, UseGuards } from '@nestjs/common';
 import { AppService } from './app.service';
+import { JwtAuthGuard } from './modules/auth/guards/jwt-auth.guard';
 import { Permisos } from './modules/rbac/decorators/permisos.decorator';
 import { PermisosGuard } from './modules/rbac/guards/permisos.guard';
 
@@ -13,7 +14,7 @@ export class AppController {
   }
 
   @Get('admin/users')
-  @UseGuards(PermisosGuard)
+  @UseGuards(JwtAuthGuard, PermisosGuard)
   @Permisos('users.read')
   getUsersAdminView(): string {
     return this.appService.getUsersAdminView();

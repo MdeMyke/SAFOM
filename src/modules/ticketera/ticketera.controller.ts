@@ -1,9 +1,11 @@
-import { Body, Controller, Get, Param, ParseIntPipe, Patch, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Param, ParseIntPipe, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CreateTicketDto } from './dto/create-ticket.dto';
 import { AssignTicketDto } from './dto/assign-ticket.dto';
 import { TicketeraService } from './ticketera.service';
 
 @Controller()
+@UseGuards(JwtAuthGuard)
 export class TicketeraController {
   constructor(private readonly ticketeraService: TicketeraService) {}
 

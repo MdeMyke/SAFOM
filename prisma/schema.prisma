@@ -23,14 +23,30 @@ model User {
   updatedAt        DateTime   @updatedAt @map("updated_at")
   deletedAt        DateTime?  @map("deleted_at")
   roles            UserRole[]
+  sessions         Session[]
 
   // Relaciones inversas (requeridas por Prisma)
-  ticketsCreados   Ticket[]           @relation("TicketUsuario")
-  comentarios      Comentario[]       @relation("ComentarioUsuario")
-  historialCreado  HistorialTicket[]  @relation("HistorialCreador")
-  asignacionesA    TicketAsignacion[] @relation("AsignacionUsuario")
-  asignacionesPor  TicketAsignacion[] @relation("AsignacionPor")
-  ticketsArchivados Ticket[]          @relation("TicketArchivadoPor")
+  ticketsCreados    Ticket[]           @relation("TicketUsuario")
+  comentarios       Comentario[]       @relation("ComentarioUsuario")
+  historialCreado   HistorialTicket[]  @relation("HistorialCreador")
+  asignacionesA     TicketAsignacion[] @relation("AsignacionUsuario")
+  asignacionesPor   TicketAsignacion[] @relation("AsignacionPor")
+  ticketsArchivados Ticket[]           @relation("TicketArchivadoPor")
+}
+
+model Session {
+  id           Int      @id @default(autoincrement())
+  userId       Int?     @map("user_id")
+  refreshToken String   @map("refresh_token") @db.Text
+  ipAddress    String?  @map("ip_address") @db.VarChar(50)
+  userAgent    String?  @map("user_agent") @db.Text
+  expiresAt    DateTime @map("expires_at")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("sessions")
 }
 
 model Role {
@@ -166,20 +182,20 @@ model Ticket {
   titulo      String
   descripcion String? @db.Text
 
-  solicitanteUserId Int  @map("solicitante_user_id")
-  categoriaId    Int  @map("categoria_id")
-  subcategoriaId Int  @map("subcategoria_id")
-  prioridadId    Int  @map("prioridad_id")
-  estadoId       Int  @map("estado_id")
+  solicitanteUserId Int @map("solicitante_user_id")
+  categoriaId       Int @map("categoria_id")
+  subcategoriaId    Int @map("subcategoria_id")
+  prioridadId       Int @map("prioridad_id")
+  estadoId          Int @map("estado_id")
 
-  createdAt DateTime  @default(now()) @map("created_at")
-  updatedAt DateTime  @updatedAt @map("updated_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
   archivadoAt DateTime? @map("archivado_at")
   archivadoBy Int?      @map("archivado_by")
-  deletedAt DateTime? @map("deleted_at")
-  createdBy Int?      @map("created_by")
-  updatedBy Int?      @map("updated_by")
-  deletedBy Int?      @map("deleted_by")
+  deletedAt   DateTime? @map("deleted_at")
+  createdBy   Int?      @map("created_by")
+  updatedBy   Int?      @map("updated_by")
+  deletedBy   Int?      @map("deleted_by")
 
   user         User         @relation("TicketUsuario", fields: [solicitanteUserId], references: [id], onDelete: Restrict, onUpdate: Cascade)
   archivadoPor User?        @relation("TicketArchivadoPor", fields: [archivadoBy], references: [id], onDelete: SetNull, onUpdate: Cascade)

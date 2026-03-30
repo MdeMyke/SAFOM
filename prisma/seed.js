@@ -1,5 +1,6 @@
 require('dotenv').config();
 const { PrismaClient } = require('@prisma/client');
+const bcrypt = require('bcrypt');
 
 const prisma = new PrismaClient();
 
@@ -44,6 +45,41 @@ async function main() {
     where: { roleId_permissionId: { roleId: superAdmin.id, permissionId: userRead.id } },
     update: {},
     create: { roleId: superAdmin.id, permissionId: userRead.id },
+  });
+
+  // =========================
+  // USUARIO INICIAL (AUTH)
+  // =========================
+  const initialEmail = (process.env.SEED_ADMIN_EMAIL || 'admin@safom.local').trim().toLowerCase();
+  const initialPassword = process.env.SEED_ADMIN_PASSWORD || 'Admin123*';
+  const initialCedula = process.env.SEED_ADMIN_CEDULA || '0000000000';
+  const initialNombre = process.env.SEED_ADMIN_NOMBRE || 'Super Admin';
+
+  const passwordHash = await bcrypt.hash(initialPassword, 10);
+
+  const seededUser = await prisma.user.upsert({
+    where: { correo: initialEmail },
+    update: {
+      nombre: initialNombre,
+      cedula: initialCedula,
+      password: passwordHash,
+      passwordChangeAt: new Date(),
+      deletedAt: null,
+    },
+    create: {
+      correo: initialEmail,
+      nombre: initialNombre,
+      cedula: initialCedula,
+      password: passwordHash,
+      passwordChangeAt: new Date(),
+    },
+    select: { id: true, correo: true },
+  });
+
+  await prisma.userRole.upsert({
+    where: { userId_roleId: { userId: seededUser.id, roleId: superAdmin.id } },
+    update: {},
+    create: { userId: seededUser.id, roleId: superAdmin.id },
   });
 
   // =========================
