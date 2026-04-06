@@ -3,10 +3,323 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { CreateTicketDto } from './dto/create-ticket.dto';
 import { AssignTicketDto } from './dto/assign-ticket.dto';
 import { RedirectTicketDto } from './dto/redirect-ticket.dto';
+import { CreateResolucionCierreDto } from './dto/create-resolucion-cierre.dto';
+import { ReabrirTicketDto } from './dto/reabrir-ticket.dto';
 
 @Injectable()
 export class TicketeraService {
   constructor(private readonly prisma: PrismaService) {}
+
+  async getHistorialResoluciones(ticketId: number) {
+    const ticket = await this.prisma.ticket.findFirst({
+      where: { id: ticketId, deletedAt: null },
+      select: { id: true },
+    });
+    if (!ticket) throw new NotFoundException('Ticket no encontrado');
+
+    const historial = await this.prisma.historialTicket.findMany({
+      where: {
+        ticketId,
+        deletedAt: null,
+        accion: { in: ['resolucion', 'cierre', 'reabierto'] },
+      },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        accion: true,
+        descripcion: true,
+        createdAt: true,
+        creador: { select: { nombre: true } },
+      },
+    });
+
+    return historial.map((h) => ({
+      id: h.id,
+      tipo: (h.accion as 'resolucion' | 'cierre' | 'reabierto') ?? 'resolucion',
+      mensaje: h.descripcion ?? '',
+      createdAt: h.createdAt.toISOString(),
+      autorNombre: h.creador?.nombre ?? 'Usuario',
+    }));
+  }
+
+  async createResolucionCierre(ticketId: number, dto: CreateResolucionCierreDto, actorId?: number) {
+    if (!actorId) throw new BadRequestException('No autenticado');
+
+    const tipo = dto.tipo;
+    if (tipo !== 'resolucion' && tipo !== 'cierre') {
+      throw new BadRequestException('Tipo inválido');
+    }
+
+    const mensaje = (dto.mensaje ?? '').trim();
+    if (!mensaje || mensaje.length < 3) {
+      throw new BadRequestException('El mensaje es requerido');
+    }
+
+    const ticket = await this.prisma.ticket.findFirst({
+      where: { id: ticketId, deletedAt: null },
+      select: { id: true, estadoId: true },
+    });
+    if (!ticket) throw new NotFoundException('Ticket no encontrado');
+
+    const targetEstadoNombre = tipo === 'cierre' ? 'cerrado' : 'pendiente_aprobacion';
+    const targetEstado = await this.prisma.estado.findFirst({
+      where: { deletedAt: null, nombre: targetEstadoNombre },
+      select: { id: true, nombre: true },
+    });
+    if (!targetEstado) {
+      throw new NotFoundException(`No existe el estado '${targetEstadoNombre}'`);
+    }
+
+    const valorAnterior = { estado_id: ticket.estadoId } as any;
+    const valorNuevo = { estado_id: targetEstado.id, tipo } as any;
+
+    const created = await this.prisma.$transaction(async (tx) => {
+      await tx.ticket.update({
+        where: { id: ticketId },
+        data: { estadoId: targetEstado.id, updatedBy: actorId },
+        select: { id: true },
+      });
+
+      return tx.historialTicket.create({
+        data: {
+          ticketId,
+          accion: tipo,
+          descripcion: mensaje,
+          valorAnterior: valorAnterior as any,
+          valorNuevo: valorNuevo as any,
+          createdBy: actorId,
+        },
+        select: {
+          id: true,
+          accion: true,
+          descripcion: true,
+          createdAt: true,
+          creador: { select: { nombre: true } },
+        },
+      });
+    });
+
+    return {
+      id: created.id,
+      tipo: (created.accion as 'resolucion' | 'cierre') ?? tipo,
+      mensaje: created.descripcion ?? '',
+      createdAt: created.createdAt.toISOString(),
+      autorNombre: created.creador?.nombre ?? 'Usuario',
+    };
+  }
+
+  async reabrirTicket(ticketId: number, dto: ReabrirTicketDto, actorId?: number) {
+    if (!actorId) throw new BadRequestException('No autenticado');
+
+    const mensaje = (dto.mensaje ?? '').trim() || 'Ticket reabierto';
+
+    const ticket = await this.prisma.ticket.findFirst({
+      where: { id: ticketId, deletedAt: null },
+      select: { id: true, estadoId: true },
+    });
+    if (!ticket) throw new NotFoundException('Ticket no encontrado');
+
+    const estadoAbierto = await this.prisma.estado.findFirst({
+      where: { deletedAt: null, nombre: 'abierto' },
+      select: { id: true, nombre: true },
+    });
+    if (!estadoAbierto) {
+      throw new NotFoundException(`No existe el estado 'abierto'`);
+    }
+
+    const valorAnterior = { estado_id: ticket.estadoId } as any;
+    const valorNuevo = { estado_id: estadoAbierto.id } as any;
+
+    const created = await this.prisma.$transaction(async (tx) => {
+      await tx.ticket.update({
+        where: { id: ticketId },
+        data: { estadoId: estadoAbierto.id, updatedBy: actorId },
+        select: { id: true },
+      });
+
+      return tx.historialTicket.create({
+        data: {
+          ticketId,
+          accion: 'reabierto',
+          descripcion: mensaje,
+          valorAnterior: valorAnterior as any,
+          valorNuevo: valorNuevo as any,
+          createdBy: actorId,
+        },
+        select: {
+          id: true,
+          accion: true,
+          descripcion: true,
+          createdAt: true,
+          creador: { select: { nombre: true } },
+        },
+      });
+    });
+
+    return {
+      id: created.id,
+      tipo: 'reabierto' as const,
+      mensaje: created.descripcion ?? '',
+      createdAt: created.createdAt.toISOString(),
+      autorNombre: created.creador?.nombre ?? 'Usuario',
+    };
+  }
+
+  async getTimeline(ticketId: number) {
+    const ticket = await this.prisma.ticket.findFirst({
+      where: { id: ticketId, deletedAt: null },
+      select: {
+        id: true,
+        codigo: true,
+        createdAt: true,
+        user: { select: { nombre: true } },
+      },
+    });
+    if (!ticket) {
+      throw new NotFoundException('Ticket no encontrado');
+    }
+
+    const [asignaciones, historial] = await Promise.all([
+      this.prisma.ticketAsignacion.findMany({
+        where: { ticketId },
+        orderBy: { asignadoEn: 'asc' },
+        select: {
+          id: true,
+          asignadoEn: true,
+          esActual: true,
+          user: { select: { nombre: true } },
+          por: { select: { nombre: true } },
+        },
+      }),
+      this.prisma.historialTicket.findMany({
+        where: { ticketId, deletedAt: null },
+        orderBy: { createdAt: 'asc' },
+        select: {
+          id: true,
+          accion: true,
+          descripcion: true,
+          createdAt: true,
+          creador: { select: { nombre: true } },
+        },
+      }),
+    ]);
+
+    const events: Array<{
+      id: string;
+      tipo: 'creacion' | 'asignacion' | 'historial';
+      fecha: string;
+      titulo: string;
+      detalle?: string | null;
+    }> = [];
+
+    // 1) Siempre empieza con la creación del ticket
+    events.push({
+      id: `creacion_${ticket.id}`,
+      tipo: 'creacion',
+      fecha: ticket.createdAt.toISOString(),
+      titulo: `Ticket creado por ${ticket.user?.nombre ?? 'Usuario'}`,
+      detalle: `Código ${ticket.codigo}`,
+    });
+
+    // 2) Puntos por asignaciones (tabla ticket_asignaciones)
+    for (const a of asignaciones) {
+      const asignadoA = a.user?.nombre ?? 'Usuario';
+      const por = a.por?.nombre ?? 'Usuario';
+      events.push({
+        id: `asignacion_${a.id}`,
+        tipo: 'asignacion',
+        fecha: a.asignadoEn.toISOString(),
+        titulo: `Asignado a ${asignadoA}`,
+        detalle: `Por ${por}${a.esActual ? ' (actual)' : ''}`,
+      });
+    }
+
+    // 3) Puntos por historial (tabla historial_tickets)
+    for (const h of historial) {
+      const creador = h.creador?.nombre ?? 'Usuario';
+      events.push({
+        id: `historial_${h.id}`,
+        tipo: 'historial',
+        fecha: h.createdAt.toISOString(),
+        titulo: `${h.accion} · ${creador}`,
+        detalle: h.descripcion ?? null,
+      });
+    }
+
+    // Orden global por fecha
+    events.sort((a, b) => new Date(a.fecha).getTime() - new Date(b.fecha).getTime());
+    return events;
+  }
+
+  async getComentarios(ticketId: number, actorId?: number) {
+    const comments = await this.prisma.comentario.findMany({
+      where: { ticketId, deletedAt: null },
+      orderBy: { createdAt: 'asc' },
+      select: {
+        id: true,
+        comentario: true,
+        createdAt: true,
+        userId: true,
+        user: {
+          select: {
+            nombre: true,
+          },
+        },
+      },
+    });
+
+    return comments.map((c) => ({
+      id: c.id,
+      texto: (c.comentario ?? '').toString(),
+      createdAt: c.createdAt.toISOString(),
+      autor: actorId && c.userId === actorId ? 'yo' : 'otro',
+      autorNombre: c.user?.nombre ?? 'Usuario',
+    }));
+  }
+
+  async createComentario(ticketId: number, texto: string | undefined | null, actorId?: number) {
+    const trimmed = (texto ?? '').trim();
+    if (!trimmed || trimmed.length < 1) {
+      throw new BadRequestException('El texto del comentario es requerido');
+    }
+    if (!actorId) {
+      throw new BadRequestException('No autenticado');
+    }
+
+    const ticket = await this.prisma.ticket.findFirst({
+      where: { id: ticketId, deletedAt: null },
+      select: { id: true },
+    });
+
+    if (!ticket) throw new NotFoundException('Ticket no encontrado');
+
+    const comentario = await this.prisma.comentario.create({
+      data: {
+        ticketId,
+        userId: actorId,
+        comentario: trimmed,
+        createdBy: actorId,
+        updatedBy: actorId,
+      },
+      select: {
+        id: true,
+        comentario: true,
+        createdAt: true,
+        userId: true,
+        user: {
+          select: { nombre: true },
+        },
+      },
+    });
+
+    return {
+      id: comentario.id,
+      texto: (comentario.comentario ?? '').toString(),
+      createdAt: comentario.createdAt.toISOString(),
+      autor: 'yo',
+      autorNombre: comentario.user?.nombre ?? 'Tú',
+    };
+  }
 
   async findTickets(params?: { archived?: boolean }) {
     const archived = params?.archived;

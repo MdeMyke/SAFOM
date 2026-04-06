@@ -7,6 +7,9 @@ const prisma = new PrismaClient();
 async function main() {
   const roles = [
     { name: 'super_admin', description: 'Acceso total al sistema' },
+    { name: 'admin', description: 'Administrador del sistema' },
+    { name: 'interno', description: 'Usuario interno' },
+    { name: 'externo', description: 'Usuario externo' },
     { name: 'soporte', description: 'Soporte funcional y operativo' },
     { name: 'desarrollo', description: 'Equipo de desarrollo' },
     { name: 'gestion_de_datos', description: 'Gestion y calidad de datos' },
@@ -18,6 +21,10 @@ async function main() {
     { action: 'create', resource: 'users', description: 'Crear usuarios' },
     { action: 'update', resource: 'users', description: 'Editar usuarios' },
     { action: 'delete', resource: 'users', description: 'Eliminar usuarios' },
+    // Permisos globales (para pruebas)
+    { action: 'externo', resource: 'global', description: 'Permiso global para usuarios externos' },
+    { action: 'interno', resource: 'global', description: 'Permiso global para usuarios internos' },
+    { action: 'admin', resource: 'global', description: 'Permiso global para administradores' },
   ];
 
   for (const role of roles) {
@@ -37,15 +44,42 @@ async function main() {
   }
 
   const superAdmin = await prisma.role.findUniqueOrThrow({ where: { name: 'super_admin' } });
-  const userRead = await prisma.permission.findUniqueOrThrow({
-    where: { action_resource: { action: 'read', resource: 'users' } },
+  const adminRole = await prisma.role.findUniqueOrThrow({ where: { name: 'admin' } });
+  const internoRole = await prisma.role.findUniqueOrThrow({ where: { name: 'interno' } });
+  const externoRole = await prisma.role.findUniqueOrThrow({ where: { name: 'externo' } });
+
+  const permissionGlobalExterno = await prisma.permission.findUniqueOrThrow({
+    where: { action_resource: { action: 'externo', resource: 'global' } },
+  });
+  const permissionGlobalInterno = await prisma.permission.findUniqueOrThrow({
+    where: { action_resource: { action: 'interno', resource: 'global' } },
+  });
+  const permissionGlobalAdmin = await prisma.permission.findUniqueOrThrow({
+    where: { action_resource: { action: 'admin', resource: 'global' } },
   });
 
-  await prisma.rolePermission.upsert({
-    where: { roleId_permissionId: { roleId: superAdmin.id, permissionId: userRead.id } },
-    update: {},
-    create: { roleId: superAdmin.id, permissionId: userRead.id },
-  });
+  // Vinculos base
+  const rolePermissionPairs = [
+    // super_admin: todo lo global
+    { roleId: superAdmin.id, permissionId: permissionGlobalExterno.id },
+    { roleId: superAdmin.id, permissionId: permissionGlobalInterno.id },
+    { roleId: superAdmin.id, permissionId: permissionGlobalAdmin.id },
+    // admin: admin + interno
+    { roleId: adminRole.id, permissionId: permissionGlobalAdmin.id },
+    { roleId: adminRole.id, permissionId: permissionGlobalInterno.id },
+    // interno
+    { roleId: internoRole.id, permissionId: permissionGlobalInterno.id },
+    // externo
+    { roleId: externoRole.id, permissionId: permissionGlobalExterno.id },
+  ];
+
+  for (const pair of rolePermissionPairs) {
+    await prisma.rolePermission.upsert({
+      where: { roleId_permissionId: { roleId: pair.roleId, permissionId: pair.permissionId } },
+      update: {},
+      create: pair,
+    });
+  }
 
   // =========================
   // USUARIO INICIAL (AUTH)
