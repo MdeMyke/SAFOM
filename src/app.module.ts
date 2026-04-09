@@ -6,9 +6,10 @@ import { RbacModule } from './modules/rbac/rbac.module';
 import { UsersModule } from './modules/users/users.module';
 import { TicketeraModule } from './modules/ticketera/ticketera.module';
 import { PrismaModule } from './prisma/prisma.module';
+import { ChatbotModule } from './modules/chatbot/chatbot.module';
 
 @Module({
-  imports: [PrismaModule, AuthModule, RbacModule, UsersModule, TicketeraModule],
+  imports: [PrismaModule, AuthModule, RbacModule, UsersModule, TicketeraModule, ChatbotModule],
   controllers: [AppController],
   providers: [AppService],
 })

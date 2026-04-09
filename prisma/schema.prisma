@@ -32,6 +32,12 @@ model User {
   asignacionesA     TicketAsignacion[] @relation("AsignacionUsuario")
   asignacionesPor   TicketAsignacion[] @relation("AsignacionPor")
   ticketsArchivados Ticket[]           @relation("TicketArchivadoPor")
+
+  conversacionesChatActual             Conversacion[]             @relation("ConversacionUsuarioActual")
+  asignacionesConversacionUsuario      AsignacionConversacion[]   @relation("AsignacionConversacionUsuario")
+  asignacionesConversacionAsignadoPor  AsignacionConversacion[]   @relation("AsignacionConversacionAsignadoPor")
+  asignacionesConversacionDesasignado  AsignacionConversacion[]   @relation("AsignacionConversacionDesasignadoPor")
+  eventosChat                          EventoChat[]               @relation("EventoChatUsuario")
 }
 
 model Session {
@@ -231,7 +237,7 @@ model Comentario {
   ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   user   User   @relation("ComentarioUsuario", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
-  @@map("comentarios")
+  @@map("comentarios_tickets")
 }
 
 // =========================
@@ -277,4 +283,160 @@ model TicketAsignacion {
   por    User   @relation("AsignacionPor", fields: [asignadoPor], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
   @@map("ticket_asignaciones")
+}
+
+// =========================
+// CHATBOT / WHATSAPP
+// =========================
+
+model Conversacion {
+  id              Int       @id @default(autoincrement())
+  waId            String    @unique @map("wa_id")
+  nombre          String?
+  estado          String    @default("abierto")
+  estadoFlujo     String?   @map("estado_flujo")
+  telefono        String?
+  cedula          String?
+  currentUserId   Int?      @map("current_user_id")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  deletedAt       DateTime? @map("deleted_at")
+
+  currentUser User? @relation("ConversacionUsuarioActual", fields: [currentUserId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  mensajes                Mensaje[]
+  asignaciones            AsignacionConversacion[]
+  eventos                 EventoChat[]
+  historialEstadosConversacion HistorialEstadoConversacion[]
+
+  @@index([waId])
+  @@map("conversaciones")
+}
+
+model Mensaje {
+  id              Int      @id @default(autoincrement())
+  conversacionId  Int      @map("conversacion_id")
+  idExterno       String   @unique @map("id_externo")
+  enviadoPorMi    Boolean  @map("enviado_por_mi") @db.TinyInt
+  tipo            String
+  contenido       String?  @db.Text
+  meta            Json?    @db.Json
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  conversacion Conversacion @relation(fields: [conversacionId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  adjuntos     Adjunto[]
+
+  @@index([conversacionId])
+  @@index([createdAt])
+  @@map("mensajes")
+}
+
+model Adjunto {
+  id         Int      @id @default(autoincrement())
+  mensajeId  Int      @map("mensaje_id")
+  urlArchivo String   @map("url_archivo")
+  tipo       String
+  tamano     Int?
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  mensaje Mensaje @relation(fields: [mensajeId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([mensajeId])
+  @@map("adjuntos")
+}
+
+model Flujo {
+  id        Int      @id @default(autoincrement())
+  nombre    String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  estados EstadoFlujo[]
+  reglas  ReglaFlujo[]
+
+  @@map("flujos")
+}
+
+model EstadoFlujo {
+  id           Int      @id @default(autoincrement())
+  flujoId      Int      @map("flujo_id")
+  nombreEstado String   @map("nombre_estado")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  flujo Flujo @relation(fields: [flujoId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  reglasComoActual    ReglaFlujo[] @relation("ReglaEstadoActual")
+  reglasComoSiguiente ReglaFlujo[] @relation("ReglaSiguienteEstado")
+
+  @@index([flujoId])
+  @@map("estados_flujo")
+}
+
+model ReglaFlujo {
+  id                Int      @id @default(autoincrement())
+  flujoId           Int      @map("flujo_id")
+  estadoActualId    Int      @map("estado_actual_id")
+  tipoDisparador    String   @map("tipo_disparador")
+  valorDisparador   String?  @map("valor_disparador")
+  textoRespuesta    String   @map("texto_respuesta") @db.Text
+  siguienteEstadoId Int      @map("siguiente_estado_id")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  flujo           Flujo       @relation(fields: [flujoId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  estadoActual    EstadoFlujo @relation("ReglaEstadoActual", fields: [estadoActualId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  siguienteEstado EstadoFlujo @relation("ReglaSiguienteEstado", fields: [siguienteEstadoId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([flujoId, estadoActualId, tipoDisparador, valorDisparador])
+  @@index([flujoId, estadoActualId])
+  @@map("reglas_flujo")
+}
+
+model AsignacionConversacion {
+  id             Int       @id @default(autoincrement())
+  conversacionId Int       @map("conversacion_id")
+  userId         Int       @map("user_id")
+  assignedAt     DateTime  @default(now()) @map("assigned_at")
+  assignedBy     Int?      @map("assigned_by")
+  unassignedAt   DateTime? @map("unassigned_at")
+  unassignedBy   Int?      @map("unassigned_by")
+  isActive       Boolean   @default(true) @map("is_active") @db.TinyInt
+
+  conversacion Conversacion @relation(fields: [conversacionId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  user         User         @relation("AsignacionConversacionUsuario", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  asignadoPor  User?        @relation("AsignacionConversacionAsignadoPor", fields: [assignedBy], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  desasignadoPor User?      @relation("AsignacionConversacionDesasignadoPor", fields: [unassignedBy], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@index([conversacionId])
+  @@index([userId])
+  @@map("asignaciones_conversacion")
+}
+
+model EventoChat {
+  id             Int      @id @default(autoincrement())
+  tipoEvento     String   @map("tipo_evento")
+  userId         Int?     @map("user_id")
+  conversacionId Int?     @map("conversacion_id")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  user         User?         @relation("EventoChatUsuario", fields: [userId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  conversacion Conversacion? @relation(fields: [conversacionId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@index([conversacionId])
+  @@index([userId])
+  @@index([createdAt])
+  @@map("eventos")
+}
+
+model HistorialEstadoConversacion {
+  id                       Int      @id @default(autoincrement())
+  conversacionId           Int      @map("conversacion_id")
+  estadoAnterior           String   @map("estado_anterior")
+  estadoNuevo              String   @map("estado_nuevo")
+  idMensajeDisparador      String   @map("id_mensaje_disparador")
+  createdAt                DateTime @default(now()) @map("created_at")
+
+  conversacion Conversacion @relation(fields: [conversacionId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([conversacionId])
+  @@index([createdAt])
+  @@map("historial_estados_conversacion")
 }
