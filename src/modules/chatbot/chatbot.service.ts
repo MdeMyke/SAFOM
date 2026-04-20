@@ -3,6 +3,24 @@ import { PrismaService } from '../../prisma/prisma.service';
 
 type VerifyWebhookQuery = Record<string, unknown>;
 
+/** Catálogo `estados` (ej. id 1 = abierto). Sobrescribible con CONVERSACION_ESTADO_ABIERTO_ID. */
+const ESTADO_CONVERSACION_ABIERTO_ID =
+  Number(process.env.CONVERSACION_ESTADO_ABIERTO_ID) > 0
+    ? Number(process.env.CONVERSACION_ESTADO_ABIERTO_ID)
+    : 1;
+
+/** Catálogo `estados` (ej. id 3 = en_progreso). Sobrescribible con CONVERSACION_ESTADO_EN_PROGRESO_ID. */
+const ESTADO_CONVERSACION_EN_PROGRESO_ID =
+  Number(process.env.CONVERSACION_ESTADO_EN_PROGRESO_ID) > 0
+    ? Number(process.env.CONVERSACION_ESTADO_EN_PROGRESO_ID)
+    : 3;
+
+/** Catálogo `estados` (ej. id 6 = cerrado). Sobrescribible con CONVERSACION_ESTADO_CERRADO_ID. */
+const ESTADO_CONVERSACION_CERRADO_ID =
+  Number(process.env.CONVERSACION_ESTADO_CERRADO_ID) > 0
+    ? Number(process.env.CONVERSACION_ESTADO_CERRADO_ID)
+    : 6;
+
 @Injectable()
 export class ChatbotService {
   private readonly logger = new Logger(ChatbotService.name);
@@ -47,10 +65,11 @@ export class ChatbotService {
   async getConversations({ limit }: { limit: number }) {
     const take = clampInt(limit, 1, 100, 50);
 
-    const conversations = await this.db.conversacion.findMany({
-      take,
-      orderBy: { updatedAt: 'desc' },
+    const all = await this.db.conversacion.findMany({
+      where: { deletedAt: null },
+      orderBy: [{ id: 'desc' }],
       include: {
+        estado: { select: { id: true, nombre: true } },
         mensajes: {
           take: 1,
           orderBy: { id: 'desc' },
@@ -59,13 +78,34 @@ export class ChatbotService {
       },
     });
 
-    return conversations.map((c) => {
+    const grouped = new Map<string, typeof all>();
+    for (const c of all) {
+      if (!grouped.has(c.waId)) grouped.set(c.waId, []);
+      grouped.get(c.waId)!.push(c);
+    }
+
+    const conversations: typeof all = [];
+    for (const rows of grouped.values()) {
+      rows.sort((a: (typeof all)[number], b: (typeof all)[number]) => b.id - a.id);
+      const open = rows.find((r: (typeof all)[number]) => !this.isConversationClosedRow(r));
+      conversations.push(open ?? rows[0]);
+    }
+
+    conversations.sort((a, b) => {
+      const pin = Number(Boolean(b.fijado)) - Number(Boolean(a.fijado));
+      if (pin !== 0) return pin;
+      return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+    });
+
+    return conversations.slice(0, take).map((c) => {
       const last = c.mensajes[0] ?? null;
       return {
         conversation_id: c.id,
         wa_id: c.waId,
         name: c.nombre,
-        status: c.estado,
+        fijado: Boolean(c.fijado),
+        status: c.estado?.nombre ?? null,
+        estado_id: c.estadoId,
         last_type: last?.tipo ?? null,
         last_content: last?.contenido ?? null,
         last_created_at: last?.createdAt ?? null,
@@ -76,11 +116,7 @@ export class ChatbotService {
   async getMessages({ waId, limit }: { waId: string; limit: number }) {
     const take = clampInt(limit, 1, 200, 50);
 
-    const conversation = await this.db.conversacion.findUnique({
-      where: { waId },
-      select: { id: true },
-    });
-
+    const conversation = await this.findCurrentConversationForWaId(waId);
     if (!conversation) return [];
 
     const messages = await this.db.mensaje.findMany({
@@ -109,39 +145,518 @@ export class ChatbotService {
     }));
   }
 
-  async reply(body: { toWaId?: string; text?: string }) {
+  async reply(body: { toWaId?: string; text?: string }, actorUserId: number) {
     const toWaId = String(body?.toWaId ?? '').trim();
     const text = String(body?.text ?? '').trim();
 
     if (!toWaId || !text) {
       throw new BadRequestException('Se requiere { toWaId, text }');
     }
+    if (!actorUserId || actorUserId < 1) {
+      throw new BadRequestException('Usuario no válido');
+    }
 
     const apiJson = await this.sendWhatsAppText({ toWaId, text });
-
-    const conversation = await this.db.conversacion.upsert({
-      where: { waId: toWaId },
-      create: { waId: toWaId, nombre: null, estado: 'abierto' },
-      update: {},
-      select: { id: true },
-    });
 
     const externalId =
       (apiJson as any)?.messages?.[0]?.id ??
       `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-    await this.db.mensaje.create({
-      data: {
-        conversacionId: conversation.id,
-        idExterno: String(externalId),
-        enviadoPorMi: true,
-        tipo: 'text',
-        contenido: text,
-        meta: { outgoing: true, api: apiJson } as any,
-      },
+    await this.prisma.$transaction(async (tx) => {
+      const conv = await this.getOrCreateActiveConversationTx(tx, toWaId, null);
+
+      if (conv.estadoId === ESTADO_CONVERSACION_ABIERTO_ID) {
+        await tx.historialEstadoConversacion.create({
+          data: {
+            conversacionId: conv.id,
+            estadoAnteriorId: ESTADO_CONVERSACION_ABIERTO_ID,
+            estadoNuevoId: ESTADO_CONVERSACION_EN_PROGRESO_ID,
+            cambiadoPor: actorUserId,
+            motivo: 'Primer mensaje del agente desde inbox',
+          },
+        });
+        await tx.conversacion.update({
+          where: { id: conv.id },
+          data: { estadoId: ESTADO_CONVERSACION_EN_PROGRESO_ID },
+        });
+      }
+
+      await tx.mensaje.create({
+        data: {
+          conversacionId: conv.id,
+          idExterno: String(externalId),
+          enviadoPorMi: true,
+          tipo: 'text',
+          contenido: text,
+          meta: {
+            outgoing: true,
+            api: apiJson,
+            source: 'inbox_agent',
+            agentUserId: actorUserId,
+          } as object,
+        },
+      });
     });
 
     return { ok: true, api: apiJson };
+  }
+
+  async updateConversationStatus(opts: { waId: string; status?: string; motivo?: string; actorUserId: number }) {
+    const waId = String(opts.waId ?? '').trim();
+    const actorUserId = Number(opts.actorUserId ?? 0);
+    const normalizedStatus = normalizeStatusName(opts.status);
+    const motivo = String(opts.motivo ?? '').trim() || 'Cambio de estado desde inbox';
+
+    if (!waId) throw new BadRequestException('Se requiere waId');
+    if (!actorUserId || actorUserId < 1) throw new BadRequestException('Usuario no válido');
+    if (!normalizedStatus) throw new BadRequestException('Se requiere status');
+    if (!['resuelto', 'cerrado'].includes(normalizedStatus)) {
+      throw new BadRequestException('Estado no permitido');
+    }
+
+    const conversation = await this.findCurrentConversationForWaId(waId);
+    if (!conversation) throw new BadRequestException('Conversación no encontrada');
+
+    const targetState = await this.db.estado.findFirst({
+      where: { nombre: normalizedStatus },
+      select: { id: true, nombre: true },
+    });
+    if (!targetState) throw new BadRequestException('Estado destino no existe en catálogo');
+
+    if (conversation.estadoId === targetState.id) {
+      return {
+        ok: true,
+        conversation_id: conversation.id,
+        wa_id: conversation.waId,
+        estado_id: conversation.estadoId,
+        status: conversation.estado?.nombre ?? targetState.nombre,
+      };
+    }
+
+    await this.db.$transaction(async (tx: any) => {
+      await tx.historialEstadoConversacion.create({
+        data: {
+          conversacionId: conversation.id,
+          estadoAnteriorId: conversation.estadoId,
+          estadoNuevoId: targetState.id,
+          cambiadoPor: actorUserId,
+          motivo,
+        },
+      });
+      await tx.conversacion.update({
+        where: { id: conversation.id },
+        data: { estadoId: targetState.id },
+      });
+    });
+
+    return {
+      ok: true,
+      conversation_id: conversation.id,
+      wa_id: conversation.waId,
+      estado_id: targetState.id,
+      status: targetState.nombre,
+    };
+  }
+
+  async setConversationFijada(opts: { waId: string; fijado?: boolean; actorUserId: number }) {
+    const waId = String(opts.waId ?? '').trim();
+    const actorUserId = Number(opts.actorUserId ?? 0);
+    const fijado = Boolean(opts.fijado);
+
+    if (!waId) throw new BadRequestException('Se requiere waId');
+    if (!actorUserId || actorUserId < 1) throw new BadRequestException('Usuario no válido');
+
+    const conversation = await this.findCurrentConversationForWaId(waId);
+    if (!conversation) throw new BadRequestException('Conversación no encontrada');
+
+    if (Boolean(conversation.fijado) === fijado) {
+      return {
+        ok: true,
+        conversation_id: conversation.id,
+        wa_id: conversation.waId,
+        fijado: Boolean(conversation.fijado),
+      };
+    }
+
+    const updated = await this.db.conversacion.update({
+      where: { id: conversation.id },
+      data: { fijado },
+      select: { id: true, waId: true, fijado: true },
+    });
+
+    return {
+      ok: true,
+      conversation_id: updated.id,
+      wa_id: updated.waId,
+      fijado: Boolean(updated.fijado),
+    };
+  }
+
+  async listCategoriasRespuestas() {
+    return this.db.categoriaRespuesta.findMany({
+      where: { deletedAt: null },
+      orderBy: { nombre: 'asc' },
+      select: { id: true, nombre: true, descripcion: true, color: true },
+    });
+  }
+
+  async createCategoriaRespuesta(
+    actorUserId: number,
+    body: { nombre?: string; descripcion?: string | null; color?: string | null },
+  ) {
+    if (!actorUserId || actorUserId < 1) throw new BadRequestException('Usuario no válido');
+    const nombre = String(body?.nombre ?? '').trim();
+    if (!nombre) throw new BadRequestException('Se requiere nombre');
+
+    return this.db.categoriaRespuesta.create({
+      data: {
+        nombre,
+        descripcion: body.descripcion != null ? String(body.descripcion).trim() || null : null,
+        color: body.color != null ? String(body.color).trim() || null : null,
+        createdBy: actorUserId,
+      },
+      select: { id: true, nombre: true, descripcion: true, color: true },
+    });
+  }
+
+  async updateCategoriaRespuesta(
+    actorUserId: number,
+    id: number,
+    body: { nombre?: string; descripcion?: string | null; color?: string | null },
+  ) {
+    if (!actorUserId || actorUserId < 1) throw new BadRequestException('Usuario no válido');
+    if (!Number.isFinite(id) || id < 1) throw new BadRequestException('Id inválido');
+
+    const existing = await this.db.categoriaRespuesta.findFirst({
+      where: { id, deletedAt: null },
+      select: { id: true },
+    });
+    if (!existing) throw new BadRequestException('Categoría no encontrada');
+
+    const nombre = String(body?.nombre ?? '').trim();
+    if (!nombre) throw new BadRequestException('Se requiere nombre');
+
+    return this.db.categoriaRespuesta.update({
+      where: { id },
+      data: {
+        nombre,
+        descripcion: body.descripcion != null ? String(body.descripcion).trim() || null : null,
+        color: body.color != null ? String(body.color).trim() || null : null,
+        updatedBy: actorUserId,
+      },
+      select: { id: true, nombre: true, descripcion: true, color: true },
+    });
+  }
+
+  async deleteCategoriaRespuesta(actorUserId: number, id: number, opts?: { deleteWithRespuestas?: boolean }) {
+    if (!actorUserId || actorUserId < 1) throw new BadRequestException('Usuario no válido');
+    if (!Number.isFinite(id) || id < 1) throw new BadRequestException('Id inválido');
+    const deleteWithRespuestas = Boolean(opts?.deleteWithRespuestas);
+
+    const existing = await this.db.categoriaRespuesta.findFirst({
+      where: { id, deletedAt: null },
+      select: { id: true },
+    });
+    if (!existing) throw new BadRequestException('Categoría no encontrada');
+
+    await this.db.$transaction(async (tx: any) => {
+      if (deleteWithRespuestas) {
+        await tx.respuestaRapida.updateMany({
+          where: { categoriaId: id, deletedAt: null },
+          data: {
+            deletedAt: new Date(),
+            deletedBy: actorUserId,
+            updatedBy: actorUserId,
+          },
+        });
+      } else {
+        await tx.respuestaRapida.updateMany({
+          where: { categoriaId: id, deletedAt: null },
+          data: { categoriaId: null, updatedBy: actorUserId },
+        });
+      }
+      await tx.categoriaRespuesta.update({
+        where: { id },
+        data: {
+          deletedAt: new Date(),
+          deletedBy: actorUserId,
+          updatedBy: actorUserId,
+        },
+      });
+    });
+
+    return { ok: true };
+  }
+
+  async listRespuestasRapidas() {
+    return this.db.respuestaRapida.findMany({
+      where: { deletedAt: null },
+      orderBy: [{ fijado: 'desc' }, { orden: 'asc' }, { id: 'asc' }],
+      select: {
+        id: true,
+        titulo: true,
+        contenido: true,
+        esPublica: true,
+        categoriaId: true,
+        orden: true,
+        fijado: true,
+      },
+    });
+  }
+
+  async createRespuestaRapida(
+    actorUserId: number,
+    body: {
+      titulo?: string;
+      contenido?: string;
+      es_publica?: boolean;
+      categoria_id?: number | null;
+    },
+  ) {
+    if (!actorUserId || actorUserId < 1) throw new BadRequestException('Usuario no válido');
+    const titulo = String(body?.titulo ?? '').trim();
+    const contenido = String(body?.contenido ?? '').trim();
+    if (!titulo) throw new BadRequestException('Se requiere titulo');
+    if (!contenido) throw new BadRequestException('Se requiere contenido');
+
+    const esPublica = Boolean(body?.es_publica);
+    let categoriaId: number | null = null;
+    if (body?.categoria_id != null) {
+      const cid = Number(body.categoria_id);
+      if (!Number.isFinite(cid) || cid < 1) throw new BadRequestException('categoria_id inválido');
+      const cat = await this.db.categoriaRespuesta.findFirst({
+        where: { id: cid, deletedAt: null },
+        select: { id: true },
+      });
+      if (!cat) throw new BadRequestException('Categoría no encontrada');
+      categoriaId = cat.id;
+    }
+
+    const agg = await this.db.respuestaRapida.aggregate({ _max: { orden: true } });
+    const orden = (agg._max.orden ?? 0) + 1;
+
+    return this.db.respuestaRapida.create({
+      data: {
+        titulo,
+        contenido,
+        esPublica,
+        categoriaId,
+        orden,
+        fijado: false,
+        createdBy: actorUserId,
+      },
+      select: {
+        id: true,
+        titulo: true,
+        contenido: true,
+        esPublica: true,
+        categoriaId: true,
+        orden: true,
+        fijado: true,
+      },
+    });
+  }
+
+  async setRespuestaRapidaFijada(actorUserId: number, id: number, fijado: boolean) {
+    if (!actorUserId || actorUserId < 1) throw new BadRequestException('Usuario no válido');
+    if (!Number.isFinite(id) || id < 1) throw new BadRequestException('Id inválido');
+
+    const existing = await this.db.respuestaRapida.findFirst({
+      where: { id, deletedAt: null },
+      select: { id: true },
+    });
+    if (!existing) throw new BadRequestException('Respuesta rápida no encontrada');
+
+    return this.db.respuestaRapida.update({
+      where: { id },
+      data: {
+        fijado: Boolean(fijado),
+        updatedBy: actorUserId,
+      },
+      select: {
+        id: true,
+        titulo: true,
+        contenido: true,
+        esPublica: true,
+        categoriaId: true,
+        orden: true,
+        fijado: true,
+      },
+    });
+  }
+
+  async reorderRespuestasRapidas(actorUserId: number, ids: number[]) {
+    if (!actorUserId || actorUserId < 1) throw new BadRequestException('Usuario no válido');
+    if (!Array.isArray(ids) || ids.length === 0) throw new BadRequestException('Se requiere lista de ids');
+
+    const normalizedIds = ids.map((id) => Number(id));
+    if (normalizedIds.some((id) => !Number.isFinite(id) || id < 1)) {
+      throw new BadRequestException('Lista de ids inválida');
+    }
+    const uniq = new Set(normalizedIds);
+    if (uniq.size !== normalizedIds.length) throw new BadRequestException('La lista de ids no debe repetir valores');
+
+    const existing = await this.db.respuestaRapida.findMany({
+      where: { deletedAt: null },
+      select: { id: true },
+    });
+    if (existing.length !== normalizedIds.length) {
+      throw new BadRequestException('La lista de ids debe incluir todas las respuestas activas');
+    }
+    const existingIds = new Set(existing.map((r) => r.id));
+    if (normalizedIds.some((id) => !existingIds.has(id))) {
+      throw new BadRequestException('La lista contiene ids inexistentes');
+    }
+
+    await this.db.$transaction(
+      normalizedIds.map((id, index) =>
+        this.db.respuestaRapida.update({
+          where: { id },
+          data: {
+            orden: index + 1,
+            updatedBy: actorUserId,
+          },
+        }),
+      ),
+    );
+
+    return { ok: true };
+  }
+
+  async updateRespuestaRapida(
+    actorUserId: number,
+    id: number,
+    body: { titulo?: string; contenido?: string; categoria_id?: number | null },
+  ) {
+    if (!actorUserId || actorUserId < 1) throw new BadRequestException('Usuario no válido');
+    if (!Number.isFinite(id) || id < 1) throw new BadRequestException('Id inválido');
+
+    const existing = await this.db.respuestaRapida.findFirst({
+      where: { id, deletedAt: null },
+      select: { id: true },
+    });
+    if (!existing) throw new BadRequestException('Respuesta rápida no encontrada');
+
+    const titulo = String(body?.titulo ?? '').trim();
+    const contenido = String(body?.contenido ?? '').trim();
+    if (!titulo) throw new BadRequestException('Se requiere titulo');
+    if (!contenido) throw new BadRequestException('Se requiere contenido');
+
+    let categoriaId: number | null = null;
+    if (body?.categoria_id != null) {
+      const cid = Number(body.categoria_id);
+      if (!Number.isFinite(cid) || cid < 1) throw new BadRequestException('categoria_id inválido');
+      const cat = await this.db.categoriaRespuesta.findFirst({
+        where: { id: cid, deletedAt: null },
+        select: { id: true },
+      });
+      if (!cat) throw new BadRequestException('Categoría no encontrada');
+      categoriaId = cat.id;
+    }
+
+    return this.db.respuestaRapida.update({
+      where: { id },
+      data: {
+        titulo,
+        contenido,
+        categoriaId,
+        updatedBy: actorUserId,
+      },
+      select: {
+        id: true,
+        titulo: true,
+        contenido: true,
+        esPublica: true,
+        categoriaId: true,
+        orden: true,
+        fijado: true,
+      },
+    });
+  }
+
+  async deleteRespuestaRapida(actorUserId: number, id: number) {
+    if (!actorUserId || actorUserId < 1) throw new BadRequestException('Usuario no válido');
+    if (!Number.isFinite(id) || id < 1) throw new BadRequestException('Id inválido');
+
+    const existing = await this.db.respuestaRapida.findFirst({
+      where: { id, deletedAt: null },
+      select: { id: true },
+    });
+    if (!existing) throw new BadRequestException('Respuesta rápida no encontrada');
+
+    await this.db.respuestaRapida.update({
+      where: { id },
+      data: {
+        deletedAt: new Date(),
+        deletedBy: actorUserId,
+        updatedBy: actorUserId,
+      },
+    });
+
+    return { ok: true };
+  }
+
+  /** Conversación “vigente” para un `wa_id`: la abierta más reciente; si todas están cerradas, la última cerrada. */
+  private async findCurrentConversationForWaId(waId: string) {
+    const rows = await this.db.conversacion.findMany({
+      where: { waId, deletedAt: null },
+      orderBy: { id: 'desc' },
+      include: { estado: { select: { id: true, nombre: true } } },
+    });
+    if (!rows.length) return null;
+    const open = rows.find((r: { estadoId: number; estado?: { nombre?: string | null } | null }) => !this.isConversationClosedRow(r));
+    return open ?? rows[0];
+  }
+
+  private isConversationClosedRow(r: { estadoId: number; estado?: { nombre?: string | null } | null }): boolean {
+    if (ESTADO_CONVERSACION_CERRADO_ID > 0 && r.estadoId === ESTADO_CONVERSACION_CERRADO_ID) return true;
+    return normalizeStatusName(r.estado?.nombre ?? '') === 'cerrado';
+  }
+
+  /**
+   * Si la última conversación del número está cerrada, crea una nueva fila (mismo wa_id, nuevo id).
+   * Si no existe ninguna, crea la primera.
+   */
+  private async getOrCreateActiveConversationTx(
+    tx: any,
+    waId: string,
+    profileName: string | null | undefined,
+  ): Promise<{ id: number; estadoId: number }> {
+    const rows = await tx.conversacion.findMany({
+      where: { waId, deletedAt: null },
+      orderBy: { id: 'desc' },
+      include: { estado: { select: { id: true, nombre: true } } },
+    });
+    const latest = rows[0] ?? null;
+    if (!latest) {
+      return tx.conversacion.create({
+        data: {
+          waId,
+          nombre: profileName ?? null,
+          estadoId: ESTADO_CONVERSACION_ABIERTO_ID,
+          estadoFlujo: 'INIT',
+        },
+        select: { id: true, estadoId: true },
+      });
+    }
+    if (this.isConversationClosedRow(latest)) {
+      return tx.conversacion.create({
+        data: {
+          waId,
+          nombre: profileName ?? latest.nombre ?? null,
+          estadoId: ESTADO_CONVERSACION_ABIERTO_ID,
+          estadoFlujo: 'INIT',
+        },
+        select: { id: true, estadoId: true },
+      });
+    }
+    if (profileName != null && String(profileName).trim() !== '') {
+      await tx.conversacion.update({
+        where: { id: latest.id },
+        data: { nombre: String(profileName).trim() },
+      });
+    }
+    return { id: latest.id, estadoId: latest.estadoId };
   }
 
   private async saveIncomingWhatsAppMessages(payload: any) {
@@ -168,19 +683,11 @@ export class ChatbotService {
 
           if (!waId || !externalId) continue;
 
-          const conversation = await this.db.conversacion.upsert({
-            where: { waId },
-            create: {
-              waId,
-              nombre: profile?.name ?? null,
-              estado: 'abierto',
-              estadoFlujo: 'INIT',
-            },
-            update: {
-              nombre: profile?.name ?? undefined,
-            },
-            select: { id: true },
-          });
+          const conversation = await this.getOrCreateActiveConversationTx(
+            this.db,
+            waId,
+            profile?.name ?? null,
+          );
 
           // Evitar duplicados por id_externo UNIQUE.
           const created = await this.db.mensaje
@@ -324,15 +831,6 @@ export class ChatbotService {
         },
       });
 
-      await this.db.historialEstadoConversacion.create({
-        data: {
-          conversacionId: opts.conversationId,
-          estadoAnterior: fromState,
-          estadoNuevo: nextNombreEstado,
-          idMensajeDisparador: opts.triggerExternalId,
-        },
-      });
-
       update.estadoFlujo = nextNombreEstado;
 
       await this.db.conversacion.update({
@@ -435,6 +933,15 @@ function normalizeText(text: string) {
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/\s+/g, ' ');
+}
+
+function normalizeStatusName(value?: string) {
+  return String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, '_');
 }
 
 function extractDigits(text: string) {
