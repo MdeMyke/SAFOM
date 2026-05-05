@@ -21,6 +21,14 @@ const ESTADO_CONVERSACION_CERRADO_ID =
     ? Number(process.env.CONVERSACION_ESTADO_CERRADO_ID)
     : 6;
 
+const CHATBOT_SYSTEM_USER_ID =
+  Number(process.env.CHATBOT_SYSTEM_USER_ID ?? process.env.CHATBOT_PUBLIC_REPLY_USER_ID ?? 1) > 0
+    ? Number(process.env.CHATBOT_SYSTEM_USER_ID ?? process.env.CHATBOT_PUBLIC_REPLY_USER_ID ?? 1)
+    : 1;
+
+const ETIQUETA_CONVERSACION_ESCALADA = 'Escalado';
+const ETIQUETA_CONVERSACION_ESCALADA_COLOR = '#FED7AA';
+
 @Injectable()
 export class ChatbotService {
   private readonly logger = new Logger(ChatbotService.name);
@@ -62,14 +70,27 @@ export class ChatbotService {
     await this.saveIncomingWhatsAppMessages(payload);
   }
 
-  async getConversations({ limit }: { limit: number }) {
+  async getConversations({ limit, actorUserId }: { limit: number; actorUserId: number }) {
     const take = clampInt(limit, 1, 100, 50);
 
     const all = await this.db.conversacion.findMany({
-      where: { deletedAt: null },
+      where: {
+        deletedAt: null,
+        currentUserId: actorUserId,
+      },
       orderBy: [{ id: 'desc' }],
       include: {
         estado: { select: { id: true, nombre: true } },
+        currentUser: { select: { id: true, nombre: true } },
+        conversacionEtiquetas: {
+          where: {
+            etiqueta: {
+              nombre: ETIQUETA_CONVERSACION_ESCALADA,
+              deletedAt: null,
+            },
+          },
+          select: { id: true },
+        },
         mensajes: {
           take: 1,
           orderBy: { id: 'desc' },
@@ -103,7 +124,11 @@ export class ChatbotService {
         conversation_id: c.id,
         wa_id: c.waId,
         name: c.nombre,
+        created_at: c.createdAt,
         fijado: Boolean(c.fijado),
+        escalado: c.conversacionEtiquetas.length > 0,
+        current_user_id: c.currentUser?.id ?? null,
+        current_user_name: c.currentUser?.nombre ?? null,
         status: c.estado?.nombre ?? null,
         estado_id: c.estadoId,
         last_type: last?.tipo ?? null,
@@ -162,22 +187,22 @@ export class ChatbotService {
       (apiJson as any)?.messages?.[0]?.id ??
       `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-    await this.prisma.$transaction(async (tx) => {
-      const conv = await this.getOrCreateActiveConversationTx(tx, toWaId, null);
+    await this.prisma.$transaction(async (tx: any) => {
+      const conv = await this.getOrCreateActiveConversationTx(tx, toWaId, null, actorUserId);
 
       if (conv.estadoId === ESTADO_CONVERSACION_ABIERTO_ID) {
-        await tx.historialEstadoConversacion.create({
-          data: {
-            conversacionId: conv.id,
-            estadoAnteriorId: ESTADO_CONVERSACION_ABIERTO_ID,
-            estadoNuevoId: ESTADO_CONVERSACION_EN_PROGRESO_ID,
-            cambiadoPor: actorUserId,
-            motivo: 'Primer mensaje del agente desde inbox',
-          },
-        });
         await tx.conversacion.update({
           where: { id: conv.id },
           data: { estadoId: ESTADO_CONVERSACION_EN_PROGRESO_ID },
+        });
+        await this.registerConversationStatusChangeTx(tx, {
+          conversacionId: conv.id,
+          estadoAnteriorId: ESTADO_CONVERSACION_ABIERTO_ID,
+          estadoNuevoId: ESTADO_CONVERSACION_EN_PROGRESO_ID,
+          estadoAnteriorNombre: 'abierto',
+          estadoNuevoNombre: 'en_progreso',
+          motivo: 'Primer mensaje del agente desde inbox',
+          actorUserId,
         });
       }
 
@@ -234,18 +259,18 @@ export class ChatbotService {
     }
 
     await this.db.$transaction(async (tx: any) => {
-      await tx.historialEstadoConversacion.create({
-        data: {
-          conversacionId: conversation.id,
-          estadoAnteriorId: conversation.estadoId,
-          estadoNuevoId: targetState.id,
-          cambiadoPor: actorUserId,
-          motivo,
-        },
-      });
       await tx.conversacion.update({
         where: { id: conversation.id },
         data: { estadoId: targetState.id },
+      });
+      await this.registerConversationStatusChangeTx(tx, {
+        conversacionId: conversation.id,
+        estadoAnteriorId: conversation.estadoId,
+        estadoNuevoId: targetState.id,
+        estadoAnteriorNombre: conversation.estado?.nombre ?? null,
+        estadoNuevoNombre: targetState.nombre,
+        motivo,
+        actorUserId,
       });
     });
 
@@ -289,6 +314,315 @@ export class ChatbotService {
       conversation_id: updated.id,
       wa_id: updated.waId,
       fijado: Boolean(updated.fijado),
+    };
+  }
+
+  async escalarConversation(opts: { waId: string; actorUserId: number }) {
+    const waId = String(opts.waId ?? '').trim();
+    const actorUserId = Number(opts.actorUserId ?? 0);
+
+    if (!waId) throw new BadRequestException('Se requiere waId');
+    if (!actorUserId || actorUserId < 1) throw new BadRequestException('Usuario no válido');
+
+    const conversation = await this.findCurrentConversationForWaId(waId);
+    if (!conversation) throw new BadRequestException('Conversación no encontrada');
+
+    let alreadyEscalated = false;
+
+    await this.db.$transaction(async (tx: any) => {
+      let etiqueta = await tx.etiqueta.findUnique({
+        where: { nombre: ETIQUETA_CONVERSACION_ESCALADA },
+        select: { id: true, deletedAt: true },
+      });
+
+      if (!etiqueta) {
+        etiqueta = await tx.etiqueta.create({
+          data: {
+            nombre: ETIQUETA_CONVERSACION_ESCALADA,
+            color: ETIQUETA_CONVERSACION_ESCALADA_COLOR,
+            descripcion: 'Conversación escalada desde inbox',
+            createdBy: actorUserId,
+          },
+          select: { id: true, deletedAt: true },
+        });
+      } else if (etiqueta.deletedAt) {
+        etiqueta = await tx.etiqueta.update({
+          where: { id: etiqueta.id },
+          data: {
+            color: ETIQUETA_CONVERSACION_ESCALADA_COLOR,
+            deletedAt: null,
+            deletedBy: null,
+            updatedBy: actorUserId,
+          },
+          select: { id: true, deletedAt: true },
+        });
+      }
+
+      const relacionExistente = await tx.conversacionEtiqueta.findFirst({
+        where: {
+          conversacionId: conversation.id,
+          etiquetaId: etiqueta.id,
+        },
+        select: { id: true },
+      });
+
+      if (relacionExistente) {
+        alreadyEscalated = true;
+        return;
+      }
+
+      await tx.conversacionEtiqueta.create({
+        data: {
+          conversacionId: conversation.id,
+          etiquetaId: etiqueta.id,
+          createdBy: actorUserId,
+        },
+      });
+
+      await this.createConversationHistoryTx(tx, {
+        conversacionId: conversation.id,
+        accion: 'ESCALAR_CONVERSACION',
+        descripcion: 'Conversación escalada desde inbox',
+        valorNuevo: {
+          etiqueta_id: etiqueta.id,
+          etiqueta: ETIQUETA_CONVERSACION_ESCALADA,
+          color: ETIQUETA_CONVERSACION_ESCALADA_COLOR,
+        },
+        actorUserId,
+      });
+    });
+
+    return {
+      ok: true,
+      conversation_id: conversation.id,
+      wa_id: conversation.waId,
+      escalado: true,
+      already_escalated: alreadyEscalated,
+    };
+  }
+
+  async transferConversation(opts: { waId: string; userId: number; actorUserId: number }) {
+    const waId = String(opts.waId ?? '').trim();
+    const actorUserId = Number(opts.actorUserId ?? 0);
+    const targetUserId = Number(opts.userId ?? 0);
+
+    if (!waId) throw new BadRequestException('Se requiere waId');
+    if (!actorUserId || actorUserId < 1) throw new BadRequestException('Usuario no válido');
+    if (!targetUserId || targetUserId < 1) throw new BadRequestException('Usuario destino no válido');
+
+    const conversation = await this.findCurrentConversationForWaId(waId);
+    if (!conversation) throw new BadRequestException('Conversación no encontrada');
+
+    const targetUser = await this.db.user.findFirst({
+      where: { id: targetUserId, deletedAt: null },
+      select: { id: true, nombre: true, cedula: true },
+    });
+    if (!targetUser) throw new BadRequestException('Usuario destino no encontrado');
+
+    const activeAssignment = await this.db.asignacionConversacion.findFirst({
+      where: { conversacionId: conversation.id, isActive: true },
+      include: { user: { select: { id: true, nombre: true } } },
+      orderBy: { id: 'desc' },
+    });
+
+    if (activeAssignment?.userId === targetUser.id && conversation.currentUserId === targetUser.id) {
+      return {
+        ok: true,
+        conversation_id: conversation.id,
+        wa_id: conversation.waId,
+        current_user_id: targetUser.id,
+        current_user_name: targetUser.nombre,
+        already_assigned: true,
+      };
+    }
+
+    const previousUserId = activeAssignment?.userId ?? conversation.currentUserId ?? null;
+    const previousUserName = activeAssignment?.user?.nombre ?? null;
+
+    await this.db.$transaction(async (tx: any) => {
+      await tx.asignacionConversacion.updateMany({
+        where: { conversacionId: conversation.id, isActive: true },
+        data: {
+          isActive: false,
+          unassignedAt: new Date(),
+          unassignedBy: actorUserId,
+        },
+      });
+
+      await tx.asignacionConversacion.create({
+        data: {
+          conversacionId: conversation.id,
+          userId: targetUser.id,
+          assignedBy: actorUserId,
+          isActive: true,
+          assignedAt: new Date(),
+        },
+      });
+
+      await tx.conversacion.update({
+        where: { id: conversation.id },
+        data: {
+          currentUserId: targetUser.id,
+        },
+      });
+
+      await this.createConversationHistoryTx(tx, {
+        conversacionId: conversation.id,
+        accion: 'TRANSFERENCIA_CONVERSACION',
+        descripcion: previousUserName
+          ? `Conversación transferida de ${previousUserName} a ${targetUser.nombre}`
+          : `Conversación transferida a ${targetUser.nombre}`,
+        valorAnterior: previousUserId
+          ? {
+              current_user_id: previousUserId,
+              current_user_name: previousUserName,
+            }
+          : null,
+        valorNuevo: {
+          current_user_id: targetUser.id,
+          current_user_name: targetUser.nombre,
+        },
+        actorUserId,
+      });
+    });
+
+    return {
+      ok: true,
+      conversation_id: conversation.id,
+      wa_id: conversation.waId,
+      current_user_id: targetUser.id,
+      current_user_name: targetUser.nombre,
+      already_assigned: false,
+    };
+  }
+
+  async reportConversation(opts: { waId: string; motivo?: string; descripcion?: string; detalle?: string; actorUserId: number }) {
+    const waId = String(opts.waId ?? '').trim();
+    const motivo = String(opts.motivo ?? '').trim();
+    const descripcion = String(opts.descripcion ?? '').trim();
+    const detalle = String(opts.detalle ?? '').trim();
+    const actorUserId = Number(opts.actorUserId ?? 0);
+
+    if (!waId) throw new BadRequestException('Se requiere waId');
+    if (!motivo) throw new BadRequestException('Se requiere motivo');
+    if (!descripcion) throw new BadRequestException('Se requiere descripcion');
+    if (!actorUserId || actorUserId < 1) throw new BadRequestException('Usuario no válido');
+
+    const conversation = await this.findCurrentConversationForWaId(waId);
+    if (!conversation) throw new BadRequestException('Conversación no encontrada');
+
+    await this.db.$transaction(async (tx: any) => {
+      await this.createConversationHistoryTx(tx, {
+        conversacionId: conversation.id,
+        accion: 'REPORTE_CONVERSACION',
+        descripcion,
+        valorNuevo: {
+          motivo,
+          descripcion,
+          detalle: detalle || null,
+        },
+        actorUserId,
+      });
+    });
+
+    return {
+      ok: true,
+      conversation_id: conversation.id,
+      wa_id: conversation.waId,
+    };
+  }
+
+  async getUserPreferences(userId: number) {
+    if (!userId || userId < 1) throw new BadRequestException('Usuario no válido');
+
+    const prefs = await this.db.userPreference.findUnique({
+      where: { userId },
+      select: {
+        tema: true,
+        listaConversacionesOrden: true,
+        lunchAt: true,
+      },
+    });
+
+    return {
+      tema: Boolean(prefs?.tema ?? false),
+      lista_conversaciones_orden: Boolean(prefs?.listaConversacionesOrden ?? false),
+      lunch_at: prefs?.lunchAt ? new Date(prefs.lunchAt).toISOString() : null,
+    };
+  }
+
+  async updateUserPreferences(
+    userId: number,
+    body: { tema?: boolean; lista_conversaciones_orden?: boolean; lunch_at?: string | null; is_online?: boolean },
+  ) {
+    if (!userId || userId < 1) throw new BadRequestException('Usuario no válido');
+
+    const data: { tema?: boolean; listaConversacionesOrden?: boolean; lunchAt?: Date | null } = {};
+    if (body?.tema != null) data.tema = Boolean(body.tema);
+    if (body?.lista_conversaciones_orden != null) {
+      data.listaConversacionesOrden = Boolean(body.lista_conversaciones_orden);
+    }
+    if (Object.prototype.hasOwnProperty.call(body ?? {}, 'lunch_at')) {
+      if (body?.lunch_at == null || String(body.lunch_at).trim() === '') {
+        data.lunchAt = null;
+      } else {
+        const parsed = new Date(String(body.lunch_at));
+        if (Number.isNaN(parsed.getTime())) {
+          throw new BadRequestException('lunch_at inválido');
+        }
+        data.lunchAt = parsed;
+      }
+    }
+    if (Object.keys(data).length === 0) {
+      if (!Object.prototype.hasOwnProperty.call(body ?? {}, 'is_online')) {
+        throw new BadRequestException('No hay preferencias para actualizar');
+      }
+    }
+
+    const prefs = await this.db.$transaction(async (tx: any) => {
+      const currentPreferences = await tx.userPreference.findUnique({
+        where: { userId },
+        select: { lunchAt: true },
+      });
+
+      if (data.lunchAt && currentPreferences?.lunchAt && isSameUtcDate(currentPreferences.lunchAt, data.lunchAt)) {
+        throw new BadRequestException('Ya registraste tu lunch hoy. No puedes volver a activarlo hasta mañana.');
+      }
+
+      const updatedPreferences = await tx.userPreference.upsert({
+        where: { userId },
+        update: data,
+        create: {
+          userId,
+          ...data,
+        },
+        select: {
+          tema: true,
+          listaConversacionesOrden: true,
+          lunchAt: true,
+        },
+      });
+
+      const userOnlineUpdate =
+        body?.is_online != null ? Boolean(body.is_online) : Object.prototype.hasOwnProperty.call(body ?? {}, 'lunch_at') ? !data.lunchAt : null;
+
+      if (userOnlineUpdate != null) {
+        await tx.user.update({
+          where: { id: userId },
+          data: {
+            isOnline: userOnlineUpdate,
+          },
+        });
+      }
+
+      return updatedPreferences;
+    });
+
+    return {
+      ok: true,
+      tema: Boolean(prefs.tema),
+      lista_conversaciones_orden: Boolean(prefs.listaConversacionesOrden),
+      lunch_at: prefs.lunchAt ? new Date(prefs.lunchAt).toISOString() : null,
     };
   }
 
@@ -597,6 +931,77 @@ export class ChatbotService {
   }
 
   /** Conversación “vigente” para un `wa_id`: la abierta más reciente; si todas están cerradas, la última cerrada. */
+  private async createConversationHistoryTx(
+    tx: any,
+    opts: {
+      conversacionId: number;
+      accion: string;
+      descripcion?: string | null;
+      valorAnterior?: Record<string, unknown> | null;
+      valorNuevo?: Record<string, unknown> | null;
+      actorUserId: number;
+    },
+  ) {
+    await tx.historialConversacion.create({
+      data: {
+        conversacionId: opts.conversacionId,
+        accion: opts.accion,
+        descripcion: opts.descripcion ?? null,
+        valorAnterior: (opts.valorAnterior ?? null) as any,
+        valorNuevo: (opts.valorNuevo ?? null) as any,
+        createdBy: opts.actorUserId,
+      },
+    });
+  }
+
+  private async registerConversationStatusChangeTx(
+    tx: any,
+    opts: {
+      conversacionId: number;
+      estadoAnteriorId: number;
+      estadoNuevoId: number;
+      estadoAnteriorNombre?: string | null;
+      estadoNuevoNombre?: string | null;
+      motivo: string;
+      actorUserId: number;
+    },
+  ) {
+    const valorAnterior: Record<string, unknown> = { estado_id: opts.estadoAnteriorId };
+    const valorNuevo: Record<string, unknown> = { estado_id: opts.estadoNuevoId };
+
+    if (opts.estadoAnteriorNombre) valorAnterior.estado = opts.estadoAnteriorNombre;
+    if (opts.estadoNuevoNombre) valorNuevo.estado = opts.estadoNuevoNombre;
+
+    await this.createConversationHistoryTx(tx, {
+      conversacionId: opts.conversacionId,
+      accion: 'CAMBIO_ESTADO',
+      descripcion: opts.motivo,
+      valorAnterior,
+      valorNuevo,
+      actorUserId: opts.actorUserId,
+    });
+  }
+
+  private async registerConversationOpenedTx(
+    tx: any,
+    opts: {
+      conversacionId: number;
+      motivo: string;
+      actorUserId: number;
+    },
+  ) {
+    await this.createConversationHistoryTx(tx, {
+      conversacionId: opts.conversacionId,
+      accion: 'CAMBIO_ESTADO',
+      descripcion: opts.motivo,
+      valorNuevo: {
+        estado_id: ESTADO_CONVERSACION_ABIERTO_ID,
+        estado: 'abierto',
+      },
+      actorUserId: opts.actorUserId,
+    });
+  }
+
   private async findCurrentConversationForWaId(waId: string) {
     const rows = await this.db.conversacion.findMany({
       where: { waId, deletedAt: null },
@@ -621,6 +1026,7 @@ export class ChatbotService {
     tx: any,
     waId: string,
     profileName: string | null | undefined,
+    actorUserId = CHATBOT_SYSTEM_USER_ID,
   ): Promise<{ id: number; estadoId: number }> {
     const rows = await tx.conversacion.findMany({
       where: { waId, deletedAt: null },
@@ -629,7 +1035,7 @@ export class ChatbotService {
     });
     const latest = rows[0] ?? null;
     if (!latest) {
-      return tx.conversacion.create({
+      const createdConversation = await tx.conversacion.create({
         data: {
           waId,
           nombre: profileName ?? null,
@@ -638,9 +1044,15 @@ export class ChatbotService {
         },
         select: { id: true, estadoId: true },
       });
+      await this.registerConversationOpenedTx(tx, {
+        conversacionId: createdConversation.id,
+        motivo: 'Conversación creada automáticamente',
+        actorUserId,
+      });
+      return createdConversation;
     }
     if (this.isConversationClosedRow(latest)) {
-      return tx.conversacion.create({
+      const createdConversation = await tx.conversacion.create({
         data: {
           waId,
           nombre: profileName ?? latest.nombre ?? null,
@@ -649,6 +1061,12 @@ export class ChatbotService {
         },
         select: { id: true, estadoId: true },
       });
+      await this.registerConversationOpenedTx(tx, {
+        conversacionId: createdConversation.id,
+        motivo: 'Conversación creada automáticamente',
+        actorUserId,
+      });
+      return createdConversation;
     }
     if (profileName != null && String(profileName).trim() !== '') {
       await tx.conversacion.update({
@@ -687,6 +1105,7 @@ export class ChatbotService {
             this.db,
             waId,
             profile?.name ?? null,
+            CHATBOT_SYSTEM_USER_ID,
           );
 
           // Evitar duplicados por id_externo UNIQUE.
@@ -946,6 +1365,14 @@ function normalizeStatusName(value?: string) {
 
 function extractDigits(text: string) {
   return String(text ?? '').replace(/\D/g, '');
+}
+
+function isSameUtcDate(a: Date, b: Date) {
+  return (
+    a.getUTCFullYear() === b.getUTCFullYear() &&
+    a.getUTCMonth() === b.getUTCMonth() &&
+    a.getUTCDate() === b.getUTCDate()
+  );
 }
 
 function clampInt(value: number, min: number, max: number, fallback: number) {

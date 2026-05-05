@@ -149,6 +149,27 @@ async function main() {
     }
   }
 
+  const etiquetasSeed = [
+    {
+      nombre: 'Escalado',
+      color: '#FED7AA',
+      descripcion: 'Conversación escalada desde inbox',
+    },
+  ];
+
+  for (const item of etiquetasSeed) {
+    await prisma.etiqueta.upsert({
+      where: { nombre: item.nombre },
+      update: {
+        color: item.color,
+        descripcion: item.descripcion,
+        deletedAt: null,
+        deletedBy: null,
+      },
+      create: item,
+    });
+  }
+
   const categoriasSeed = [
     { nombre: 'Soporte', descripcion: 'Soporte funcional y técnico' },
     { nombre: 'Desarrollo', descripcion: 'Requerimientos y ajustes de desarrollo' },

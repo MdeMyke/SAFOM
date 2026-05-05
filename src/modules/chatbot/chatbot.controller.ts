@@ -41,8 +41,15 @@ export class ChatbotController {
 
   @Get('chatbot/conversations')
   @UseGuards(JwtAuthGuard)
-  getConversations(@Query('limit') limit?: string) {
-    return this.chatbotService.getConversations({ limit: Number(limit ?? 50) });
+  getConversations(@Req() req: Request, @Query('limit') limit?: string) {
+    const user = req.user as RequestUser | undefined;
+    if (!user?.id) {
+      throw new UnauthorizedException('No autenticado');
+    }
+    return this.chatbotService.getConversations({
+      limit: Number(limit ?? 50),
+      actorUserId: user.id,
+    });
   }
 
   @Get('chatbot/conversations/:waId/messages')
@@ -94,10 +101,80 @@ export class ChatbotController {
     });
   }
 
+  @Post('chatbot/conversations/:waId/escalar')
+  @UseGuards(JwtAuthGuard)
+  escalarConversation(@Req() req: Request, @Param('waId') waId: string) {
+    const user = req.user as RequestUser | undefined;
+    if (!user?.id) {
+      throw new UnauthorizedException('No autenticado');
+    }
+    return this.chatbotService.escalarConversation({
+      waId,
+      actorUserId: user.id,
+    });
+  }
+
+  @Post('chatbot/conversations/:waId/transferir')
+  @UseGuards(JwtAuthGuard)
+  transferConversation(@Req() req: Request, @Param('waId') waId: string, @Body() body: { userId?: number }) {
+    const user = req.user as RequestUser | undefined;
+    if (!user?.id) {
+      throw new UnauthorizedException('No autenticado');
+    }
+    return this.chatbotService.transferConversation({
+      waId,
+      userId: Number(body?.userId ?? 0),
+      actorUserId: user.id,
+    });
+  }
+
+  @Post('chatbot/conversations/:waId/reportar')
+  @UseGuards(JwtAuthGuard)
+  reportConversation(
+    @Req() req: Request,
+    @Param('waId') waId: string,
+    @Body() body: { motivo?: string; descripcion?: string; detalle?: string },
+  ) {
+    const user = req.user as RequestUser | undefined;
+    if (!user?.id) {
+      throw new UnauthorizedException('No autenticado');
+    }
+    return this.chatbotService.reportConversation({
+      waId,
+      motivo: body?.motivo,
+      descripcion: body?.descripcion,
+      detalle: body?.detalle,
+      actorUserId: user.id,
+    });
+  }
+
   @Get('chatbot/categorias-respuestas')
   @UseGuards(JwtAuthGuard)
   listCategoriasRespuestas() {
     return this.chatbotService.listCategoriasRespuestas();
+  }
+
+  @Get('chatbot/preferences')
+  @UseGuards(JwtAuthGuard)
+  getPreferences(@Req() req: Request) {
+    const user = req.user as RequestUser | undefined;
+    if (!user?.id) {
+      throw new UnauthorizedException('No autenticado');
+    }
+    return this.chatbotService.getUserPreferences(user.id);
+  }
+
+  @Post('chatbot/preferences')
+  @UseGuards(JwtAuthGuard)
+  updatePreferences(
+    @Req() req: Request,
+    @Body() body: { tema?: boolean; lista_conversaciones_orden?: boolean; lunch_at?: string | null; is_online?: boolean },
+  ) {
+    const user = req.user as RequestUser | undefined;
+    if (!user?.id) {
+      throw new UnauthorizedException('No autenticado');
+    }
+    return this.chatbotService.updateUserPreferences(user.id, body);
   }
 
   @Post('chatbot/categorias-respuestas')

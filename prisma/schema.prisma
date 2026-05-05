@@ -39,7 +39,7 @@ model User {
   asignacionesConversacionAsignadoPor  AsignacionConversacion[]   @relation("AsignacionConversacionAsignadoPor")
   asignacionesConversacionDesasignado  AsignacionConversacion[]   @relation("AsignacionConversacionDesasignadoPor")
   eventosChat                          EventoChat[]               @relation("EventoChatUsuario")
-  historialCambiosEstadoConversacion   HistorialEstadoConversacion[] @relation("HistorialConvCambiadoPor")
+  historialConversacionesCreadas       HistorialConversacion[]    @relation("HistorialConversacionCreador")
   notasConversacion                    NotaConversacion[]         @relation("NotaConversacionCreadoPor")
   notasConversacionActualizadas        NotaConversacion[]         @relation("NotaConversacionActualizadoPor")
   notasConversacionEliminadas          NotaConversacion[]         @relation("NotaConversacionEliminadoPor")
@@ -49,6 +49,7 @@ model User {
   categoriasRespuestas                 CategoriaRespuesta[]       @relation("CategoriaRespuestaCreadoPor")
   categoriasRespuestasActualizadas     CategoriaRespuesta[]       @relation("CategoriaRespuestaActualizadoPor")
   categoriasRespuestasEliminadas       CategoriaRespuesta[]       @relation("CategoriaRespuestaEliminadoPor")
+  preference                           UserPreference?
 }
 
 model Session {
@@ -186,9 +187,6 @@ model Estado {
 
   tickets        Ticket[]
   conversaciones Conversacion[]
-  historialEstadoAnterior HistorialEstadoConversacion[] @relation("HistConvEstadoAnterior")
-  historialEstadoNuevo    HistorialEstadoConversacion[] @relation("HistConvEstadoNuevo")
-
   @@map("estados")
 }
 
@@ -324,7 +322,7 @@ model Conversacion {
   mensajes                Mensaje[]
   asignaciones            AsignacionConversacion[]
   eventos                 EventoChat[]
-  historialEstadosConversacion HistorialEstadoConversacion[]
+  historialConversaciones HistorialConversacion[]
   conversacionEtiquetas   ConversacionEtiqueta[]
   notasConversacion       NotaConversacion[]
 
@@ -556,24 +554,39 @@ model EventoChat {
   @@map("eventos")
 }
 
-model HistorialEstadoConversacion {
-  id               Int      @id @default(autoincrement())
-  conversacionId   Int      @map("conversacion_id")
-  estadoAnteriorId Int      @map("estado_anterior_id")
-  estadoNuevoId    Int      @map("estado_nuevo_id")
-  cambiadoPor      Int      @map("cambiado_por")
-  motivo           String?
-  createdAt        DateTime @default(now()) @map("created_at")
+model HistorialConversacion {
+  id             Int     @id @default(autoincrement())
+  conversacionId Int     @map("conversacion_id")
+  accion         String  @db.VarChar(255)
+  descripcion    String? @db.Text
+  valorAnterior  Json?   @map("valor_anterior") @db.Json
+  valorNuevo     Json?   @map("valor_nuevo") @db.Json
 
-  conversacion   Conversacion @relation(fields: [conversacionId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  estadoAnterior Estado       @relation("HistConvEstadoAnterior", fields: [estadoAnteriorId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  estadoNuevo    Estado       @relation("HistConvEstadoNuevo", fields: [estadoNuevoId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  usuario        User         @relation("HistorialConvCambiadoPor", fields: [cambiadoPor], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  createdBy Int  @map("created_by")
+  updatedBy Int? @map("updated_by")
+  deletedBy Int? @map("deleted_by")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.DateTime(3)
+  deletedAt DateTime? @map("deleted_at") @db.DateTime(3)
+
+  conversacion Conversacion @relation(fields: [conversacionId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  creador      User         @relation("HistorialConversacionCreador", fields: [createdBy], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
   @@index([conversacionId])
-  @@index([estadoAnteriorId])
-  @@index([estadoNuevoId])
-  @@index([cambiadoPor])
+  @@index([createdBy])
   @@index([createdAt])
-  @@map("historial_estados_conversacion")
+  @@map("historial_conversaciones")
+}
+
+model UserPreference {
+  id                       Int     @id @default(autoincrement())
+  userId                   Int     @unique @map("user_id")
+  tema                     Boolean @default(false) @db.TinyInt
+  listaConversacionesOrden Boolean @default(false) @map("lista_conversaciones_orden") @db.TinyInt
+  lunchAt                  DateTime? @map("lunch_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@map("user_preferences")
 }
