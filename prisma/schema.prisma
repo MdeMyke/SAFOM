@@ -309,6 +309,8 @@ model Conversacion {
   fijado          Boolean   @default(false) @db.TinyInt
   estadoId        Int       @map("estado_id")
   estadoFlujo     String?   @map("estado_flujo")
+  /** Datos capturados por el chatbot (documento, tipo de usuario, motivo, etc.). */
+  metadata        Json?     @db.Json
   telefono        String?
   cedula          String?
   currentUserId   Int?      @map("current_user_id")
@@ -507,6 +509,10 @@ model ReglaFlujo {
   valorDisparador   String?  @map("valor_disparador")
   textoRespuesta    String   @map("texto_respuesta") @db.Text
   siguienteEstadoId Int      @map("siguiente_estado_id")
+  /** p. ej. merge_metadata, ninguna */
+  tipoAccion        String?  @map("tipo_accion")
+  /** Parches JSON para metadata de conversación u opciones (p. ej. motivoOpciones). */
+  payloadAccion     Json?    @map("payload_accion") @db.Json
   createdAt         DateTime @default(now()) @map("created_at")
 
   flujo           Flujo       @relation(fields: [flujoId], references: [id], onDelete: Cascade, onUpdate: Cascade)

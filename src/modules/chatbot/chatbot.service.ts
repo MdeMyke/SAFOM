@@ -26,6 +26,13 @@ const CHATBOT_SYSTEM_USER_ID =
     ? Number(process.env.CHATBOT_SYSTEM_USER_ID ?? process.env.CHATBOT_PUBLIC_REPLY_USER_ID ?? 1)
     : 1;
 
+/**
+ * Usuario al que se asigna la conversación cuando el visitante termina el flujo del bot
+ * (estado de flujo `esperando_asesor`). Mientras el bot recopila datos, `current_user_id` queda en null.
+ */
+const CHATBOT_AUTO_ASSIGN_USER_ID =
+  Number(process.env.CHATBOT_AUTO_ASSIGN_USER_ID ?? 32) > 0 ? Number(process.env.CHATBOT_AUTO_ASSIGN_USER_ID ?? 32) : 32;
+
 const ETIQUETA_CONVERSACION_ESCALADA = 'Escalado';
 const ETIQUETA_CONVERSACION_ESCALADA_COLOR = '#FED7AA';
 
@@ -33,6 +40,7 @@ const ETIQUETA_CONVERSACION_ESCALADA_COLOR = '#FED7AA';
 export class ChatbotService {
   private readonly logger = new Logger(ChatbotService.name);
   private static warnedMissingWhatsAppEnv = false;
+  private static warnedMissingWhapiEnv = false;
 
   constructor(private readonly prisma: PrismaService) {}
 
@@ -67,11 +75,46 @@ export class ChatbotService {
   }
 
   async receiveWebhook(payload: unknown): Promise<void> {
-    await this.saveIncomingWhatsAppMessages(payload);
+    const p: any = payload as any;
+
+    // Auto-detección: Meta Graph manda `entry`; Whapi suele mandar `messages` o `message`.
+    if (Array.isArray(p?.entry)) {
+      await this.saveIncomingWhatsAppMessages(p);
+      return;
+    }
+    if (Array.isArray(p?.messages) || p?.message) {
+      await this.saveIncomingWhapiMessages(p);
+      return;
+    }
+
+    // Si llega un POST válido pero de otro formato, no insertará nada.
+    this.logger.warn('Webhook recibido pero con formato no reconocido; no se insertó nada.', {
+      keys: p && typeof p === 'object' ? Object.keys(p).slice(0, 20) : typeof p,
+    });
   }
 
-  async getConversations({ limit, actorUserId }: { limit: number; actorUserId: number }) {
+  /**
+   * Webhook para Whapi Cloud.
+   *
+   * Whapi puede enviar payloads distintos a Meta (Graph). Este adaptador intenta extraer
+   * mensajes de texto entrantes en estructuras comunes y reutiliza la misma lógica de
+   * creación de conversación/mensaje + ejecución del flujo.
+   */
+  async receiveWhapiWebhook(payload: unknown): Promise<void> {
+    await this.saveIncomingWhapiMessages(payload as any);
+  }
+
+  async getConversations({
+    limit,
+    actorUserId,
+    tipoUsuario,
+  }: {
+    limit: number;
+    actorUserId: number;
+    tipoUsuario?: string | null;
+  }) {
     const take = clampInt(limit, 1, 100, 50);
+    const tipoFilter = normalizeConversationTipoUsuario(tipoUsuario);
 
     const all = await this.db.conversacion.findMany({
       where: {
@@ -118,8 +161,13 @@ export class ChatbotService {
       return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
     });
 
-    return conversations.slice(0, take).map((c) => {
+    const filtered = tipoFilter
+      ? conversations.filter((c) => getConversationMetadataTipoUsuario(c.metadata) === tipoFilter)
+      : conversations;
+
+    return filtered.slice(0, take).map((c) => {
       const last = c.mensajes[0] ?? null;
+      const tipoUsuarioMeta = getConversationMetadataTipoUsuario(c.metadata);
       return {
         conversation_id: c.id,
         wa_id: c.waId,
@@ -134,6 +182,10 @@ export class ChatbotService {
         last_type: last?.tipo ?? null,
         last_content: last?.contenido ?? null,
         last_created_at: last?.createdAt ?? null,
+        estado_flujo: c.estadoFlujo ?? null,
+        metadata: c.metadata ?? null,
+        tipo_usuario: tipoUsuarioMeta,
+        cedula: c.cedula ?? null,
       };
     });
   }
@@ -1040,7 +1092,8 @@ export class ChatbotService {
           waId,
           nombre: profileName ?? null,
           estadoId: ESTADO_CONVERSACION_ABIERTO_ID,
-          estadoFlujo: 'INIT',
+          estadoFlujo: 'inicio',
+          currentUserId: null,
         },
         select: { id: true, estadoId: true },
       });
@@ -1057,7 +1110,8 @@ export class ChatbotService {
           waId,
           nombre: profileName ?? latest.nombre ?? null,
           estadoId: ESTADO_CONVERSACION_ABIERTO_ID,
-          estadoFlujo: 'INIT',
+          estadoFlujo: 'inicio',
+          currentUserId: null,
         },
         select: { id: true, estadoId: true },
       });
@@ -1074,12 +1128,13 @@ export class ChatbotService {
         data: { nombre: String(profileName).trim() },
       });
     }
+
     return { id: latest.id, estadoId: latest.estadoId };
   }
 
   private async saveIncomingWhatsAppMessages(payload: any) {
     const entries = payload?.entry ?? [];
-    const flowName = (process.env.FLOW_NAME || 'main_menu').trim() || 'main_menu';
+    const flowName = (process.env.FLOW_NAME || 'soporte_horus').trim() || 'soporte_horus';
 
     for (const entry of entries) {
       const changes = entry?.changes ?? [];
@@ -1138,6 +1193,74 @@ export class ChatbotService {
     }
   }
 
+  private async saveIncomingWhapiMessages(payload: any) {
+    const flowName = (process.env.FLOW_NAME || 'soporte_horus').trim() || 'soporte_horus';
+
+    // Estructura común (según docs/implementaciones): payload.messages = [...]
+    const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+    if (!messages.length) {
+      // Algunas instalaciones mandan { event, message: {...} }
+      const single = payload?.message ? [payload.message] : [];
+      if (!single.length) return;
+      return await this.saveIncomingWhapiMessages({ messages: single });
+    }
+
+    for (const message of messages) {
+      // Campos típicos: from/to/id/text/body, type
+      const from = message?.from ?? message?.sender ?? message?.chat_id ?? message?.chatId ?? null;
+      const externalId = message?.id ?? message?.message_id ?? message?.messageId ?? null;
+      const type = String(message?.type ?? message?.message_type ?? 'unknown');
+      const textBody =
+        message?.text?.body ??
+        message?.text ??
+        message?.body ??
+        message?.message?.text?.body ??
+        message?.message?.text ??
+        null;
+
+      // Ignorar mensajes salientes (from_me) si viene en payload.
+      const fromMe = Boolean(message?.from_me ?? message?.fromMe ?? message?.self);
+      if (fromMe) continue;
+
+      const waId = typeof from === 'string' ? from.replace(/\D/g, '') : String(from ?? '').replace(/\D/g, '');
+      if (!waId) continue;
+
+      const idExterno = String(externalId ?? '').trim() || `whapi-in-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+      const conversation = await this.getOrCreateActiveConversationTx(
+        this.db,
+        waId,
+        message?.sender_name ?? message?.profile?.name ?? message?.name ?? null,
+        CHATBOT_SYSTEM_USER_ID,
+      );
+
+      const created = await this.db.mensaje
+        .create({
+          data: {
+            conversacionId: conversation.id,
+            idExterno,
+            enviadoPorMi: false,
+            tipo: type,
+            contenido: typeof textBody === 'string' ? textBody : null,
+            meta: { whapi: true, raw: message } as any,
+          },
+          select: { id: true },
+        })
+        .then(() => true)
+        .catch(() => false);
+
+      if (created && type === 'text' && typeof textBody === 'string') {
+        await this.processFlowAndReplySafe({
+          flowName,
+          conversationId: conversation.id,
+          waId,
+          triggerExternalId: idExterno,
+          incomingText: textBody,
+        });
+      }
+    }
+  }
+
   private async processFlowAndReplySafe(opts: {
     flowName: string;
     conversationId: number;
@@ -1149,8 +1272,6 @@ export class ChatbotService {
       const skipFrom = (process.env.WHATSAPP_SKIP_FROM_WA_ID || '').trim();
       if (skipFrom && opts.waId === skipFrom) return;
 
-      const normalized = normalizeText(opts.incomingText);
-
       const flujo = await this.db.flujo.findFirst({
         where: { nombre: opts.flowName },
         select: { id: true },
@@ -1159,79 +1280,57 @@ export class ChatbotService {
 
       const current = await this.db.conversacion.findUnique({
         where: { id: opts.conversationId },
-        select: { id: true, estadoFlujo: true, cedula: true, telefono: true },
+        select: { id: true, estadoFlujo: true, cedula: true, telefono: true, metadata: true },
       });
       if (!current) return;
 
-      let fromState = current.estadoFlujo || 'INIT';
-      const hasCedula = Boolean(current.cedula);
-      const hasTelefono = Boolean(current.telefono);
-      if (fromState === 'INIT') {
-        if (hasCedula && hasTelefono) fromState = 'MENU';
-        else if (hasCedula && !hasTelefono) fromState = 'PEDIR_TELEFONO';
-      }
+      let fromState = String(current.estadoFlujo || 'inicio').trim() || 'inicio';
+      if (fromState === 'INIT') fromState = 'inicio';
 
       const estadoActual = await this.db.estadoFlujo.findFirst({
         where: { flujoId: flujo.id, nombreEstado: fromState },
-        select: { id: true },
+        select: { id: true, nombreEstado: true },
       });
       if (!estadoActual) return;
 
-      // Buscar regla por texto exacto normalizado; si no, default.
-      let rule = await this.db.reglaFlujo.findFirst({
-        where: {
-          flujoId: flujo.id,
-          estadoActualId: estadoActual.id,
-          tipoDisparador: 'text_equals',
-          valorDisparador: normalized,
-        },
+      const rules = await this.db.reglaFlujo.findMany({
+        where: { flujoId: flujo.id, estadoActualId: estadoActual.id },
         include: { siguienteEstado: { select: { nombreEstado: true } } },
+        orderBy: { id: 'asc' },
       });
 
-      if (!rule) {
-        rule = await this.db.reglaFlujo.findFirst({
-          where: {
-            flujoId: flujo.id,
-            estadoActualId: estadoActual.id,
-            tipoDisparador: 'default',
-            valorDisparador: null,
-          },
-          include: { siguienteEstado: { select: { nombreEstado: true } } },
-        });
-      }
-
+      const rule = pickMatchingFlowRule(rules, opts.incomingText);
       if (!rule) return;
 
       const nextNombreEstado = rule.siguienteEstado.nombreEstado;
 
-      const update: { cedula?: string; telefono?: string; estadoFlujo?: string } = {};
-
-      if (fromState === 'PEDIR_CEDULA') {
-        const cedulaDigits = extractDigits(opts.incomingText);
-        if (cedulaDigits.length < 6) {
-          await this.sendAndPersistOutgoing({
-            conversationId: opts.conversationId,
-            waId: opts.waId,
-            text: 'No pude leer la cédula. Envíala solo con números (ej: 12345678).',
-            meta: { kind: 'validation', state: fromState },
-          });
-          return;
-        }
-        update.cedula = cedulaDigits;
+      const metaPatch = buildMetadataPatchFromRule(rule, opts.incomingText);
+      if (fromState === 'esperando_cedula' || fromState === 'esperando_nit') {
+        const digits = extractDigits(opts.incomingText);
+        if (digits.length >= 5) metaPatch.numero_documento = digits;
       }
 
-      if (fromState === 'PEDIR_TELEFONO') {
-        const telefonoDigits = extractDigits(opts.incomingText);
-        if (telefonoDigits.length < 7) {
-          await this.sendAndPersistOutgoing({
-            conversationId: opts.conversationId,
-            waId: opts.waId,
-            text: 'No pude leer el teléfono. Envíalo solo con números (ej: 04123456789).',
-            meta: { kind: 'validation', state: fromState },
-          });
-          return;
-        }
-        update.telefono = telefonoDigits;
+      const mergedMeta = mergeConversationMetadata(current.metadata, metaPatch);
+
+      const update: {
+        cedula?: string;
+        telefono?: string;
+        estadoFlujo?: string;
+        metadata?: Record<string, unknown>;
+        currentUserId?: number | null;
+      } = {
+        estadoFlujo: nextNombreEstado,
+        metadata: mergedMeta,
+      };
+
+      if (nextNombreEstado === 'esperando_asesor') {
+        update.currentUserId = CHATBOT_AUTO_ASSIGN_USER_ID;
+      }
+
+      const td = mergedMeta.tipo_documento;
+      const nd = mergedMeta.numero_documento;
+      if (td === 'cedula' && nd != null && String(nd).length > 0) {
+        update.cedula = String(nd).replace(/\D/g, '');
       }
 
       const apiJson = await this.sendWhatsAppText({ toWaId: opts.waId, text: rule.textoRespuesta });
@@ -1250,12 +1349,25 @@ export class ChatbotService {
         },
       });
 
-      update.estadoFlujo = nextNombreEstado;
-
       await this.db.conversacion.update({
         where: { id: opts.conversationId },
         data: update,
       });
+
+      if (nextNombreEstado === 'esperando_asesor') {
+        const asesor = await this.db.user.findFirst({
+          where: { id: CHATBOT_AUTO_ASSIGN_USER_ID, deletedAt: null },
+          select: { nombre: true },
+        });
+        const nombreAsesor = (asesor?.nombre ?? '').trim() || 'tu asesor';
+        const textoBienvenida = buildPostAsignacionWelcomeMessage(nombreAsesor);
+        await this.sendAndPersistOutgoing({
+          conversationId: opts.conversationId,
+          waId: opts.waId,
+          text: textoBienvenida,
+          meta: { kind: 'post_asignacion_agente', agente_user_id: CHATBOT_AUTO_ASSIGN_USER_ID },
+        });
+      }
     } catch (err) {
       this.logger.error('Error procesando flujo (state machine)', err as any);
     }
@@ -1285,12 +1397,20 @@ export class ChatbotService {
   }
 
   /**
-   * Envía texto por WhatsApp Cloud API (Graph).
-   * Si no hay `WHATSAPP_ACCESS_TOKEN` / `WHATSAPP_PHONE_NUMBER_ID` (como en desarrollo local),
-   * no lanza: devuelve un objeto compatible para que el mensaje se guarde en BD con id local
-   * (misma idea que en FOMAGPRUEBACHAT cuando no hay credenciales).
+   * Envía texto por WhatsApp.
+   *
+   * Prioridad:
+   * - Si hay `WHAPI_TOKEN`, envía por Whapi Cloud (`WHAPI_BASE_URL`, default: https://gate.whapi.cloud).
+   * - Si no, usa WhatsApp Cloud API (Graph) con `WHATSAPP_ACCESS_TOKEN` / `WHATSAPP_PHONE_NUMBER_ID`.
+   *
+   * Si no hay credenciales (como en desarrollo local), no lanza: devuelve un objeto compatible
+   * para que el mensaje se guarde en BD con id local.
    */
   private async sendWhatsAppText({ toWaId, text }: { toWaId: string; text: string }) {
+    if (this.hasWhapiEnv()) {
+      return await this.sendWhapiText({ toWaId, text });
+    }
+
     if (!this.hasWhatsAppEnv()) {
       if (!ChatbotService.warnedMissingWhatsAppEnv) {
         ChatbotService.warnedMissingWhatsAppEnv = true;
@@ -1338,11 +1458,162 @@ export class ChatbotService {
     return apiJson;
   }
 
+  private hasWhapiEnv(): boolean {
+    const token = String(process.env.WHAPI_TOKEN ?? '').trim();
+    return Boolean(token);
+  }
+
+  private async sendWhapiText({ toWaId, text }: { toWaId: string; text: string }) {
+    const baseUrl = String(process.env.WHAPI_BASE_URL ?? 'https://gate.whapi.cloud').trim() || 'https://gate.whapi.cloud';
+    const token = String(process.env.WHAPI_TOKEN ?? '').trim();
+
+    if (!token) {
+      if (!ChatbotService.warnedMissingWhapiEnv) {
+        ChatbotService.warnedMissingWhapiEnv = true;
+        this.logger.warn('WHAPI_TOKEN no está definido; no se enviará por Whapi.');
+      }
+      const localId = `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      return {
+        messages: [{ id: localId }],
+        skipped: true,
+        reason: 'missing_whapi_env',
+        to: toWaId,
+        text,
+      };
+    }
+
+    const to = String(toWaId ?? '').trim().replace(/\D/g, '');
+    const url = `${baseUrl.replace(/\/+$/, '')}/messages/text`;
+    const payload = { to, body: text };
+
+    const apiRes = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const apiJson = await apiRes.json().catch(() => ({}));
+    if (!apiRes.ok) {
+      this.logger.error('Error Whapi API', { status: apiRes.status, apiJson });
+      throw new Error('Error enviando mensaje con Whapi');
+    }
+
+    // Normalizamos a una forma parecida a Meta para que el resto del código tome `.messages[0].id`.
+    const messageId = (apiJson as any)?.message?.id ?? (apiJson as any)?.id ?? (apiJson as any)?.messages?.[0]?.id;
+    return messageId ? { ...apiJson, messages: [{ id: String(messageId) }] } : apiJson;
+  }
+
   private hasWhatsAppEnv(): boolean {
     const token = String(process.env.WHATSAPP_ACCESS_TOKEN ?? '').trim();
     const phoneId = String(process.env.WHATSAPP_PHONE_NUMBER_ID ?? '').trim();
     return Boolean(token && phoneId);
   }
+}
+
+function flowRulePriority(tipoDisparador: string): number {
+  switch (tipoDisparador) {
+    case 'texto':
+    case 'text_equals':
+      return 0;
+    case 'regex':
+      return 1;
+    case 'cualquier_texto':
+      return 2;
+    case 'default':
+      return 3;
+    default:
+      return 10;
+  }
+}
+
+function flowRuleMatches(
+  rule: { tipoDisparador: string; valorDisparador: string | null },
+  incomingText: string,
+): boolean {
+  const trimmed = incomingText.trim();
+  const normalized = normalizeText(incomingText);
+  const tipo = rule.tipoDisparador;
+  const val = rule.valorDisparador;
+
+  switch (tipo) {
+    case 'texto':
+    case 'text_equals':
+      if (val == null) return false;
+      return normalized === normalizeText(val);
+    case 'regex':
+      if (!val) return false;
+      try {
+        return new RegExp(val).test(trimmed);
+      } catch {
+        return false;
+      }
+    case 'cualquier_texto':
+      return val === '*' || val === '' || val == null;
+    case 'default':
+      return true;
+    default:
+      return false;
+  }
+}
+
+function pickMatchingFlowRule(rules: any[], incomingText: string): any | null {
+  const sorted = [...rules].sort((a, b) => {
+    const pa = flowRulePriority(a.tipoDisparador);
+    const pb = flowRulePriority(b.tipoDisparador);
+    if (pa !== pb) return pa - pb;
+    return (a.id ?? 0) - (b.id ?? 0);
+  });
+  for (const r of sorted) {
+    if (flowRuleMatches(r, incomingText)) return r;
+  }
+  return null;
+}
+
+const CONVERSATION_TIPOS_USUARIO = new Set(['afiliado', 'prestador', 'externo', 'empleado']);
+
+function normalizeConversationTipoUsuario(value?: string | null): string | null {
+  const raw = String(value ?? '')
+    .trim()
+    .toLowerCase();
+  return CONVERSATION_TIPOS_USUARIO.has(raw) ? raw : null;
+}
+
+function getConversationMetadataTipoUsuario(metadata: unknown): string | null {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return null;
+  return normalizeConversationTipoUsuario((metadata as Record<string, unknown>).tipo_usuario as string);
+}
+
+function mergeConversationMetadata(prev: unknown, patch: Record<string, unknown>): Record<string, unknown> {
+  const base =
+    prev && typeof prev === 'object' && !Array.isArray(prev) ? { ...(prev as Record<string, unknown>) } : {};
+  return { ...base, ...patch };
+}
+
+function buildMetadataPatchFromRule(
+  rule: { payloadAccion?: unknown; tipoAccion?: string | null },
+  incomingText: string,
+): Record<string, unknown> {
+  const accion = rule.tipoAccion ?? null;
+  if (accion && accion !== 'merge_metadata') return {};
+
+  const raw = rule.payloadAccion;
+  if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return {};
+
+  const payload = { ...(raw as Record<string, unknown>) };
+  const motivoOpciones = payload.motivoOpciones;
+  delete payload.motivoOpciones;
+
+  if (motivoOpciones && typeof motivoOpciones === 'object' && !Array.isArray(motivoOpciones)) {
+    const opt = incomingText.trim();
+    const map = motivoOpciones as Record<string, string>;
+    const motivo = map[opt];
+    if (motivo) payload.motivo = motivo;
+  }
+
+  return payload;
 }
 
 function normalizeText(text: string) {
@@ -1378,5 +1649,14 @@ function isSameUtcDate(a: Date, b: Date) {
 function clampInt(value: number, min: number, max: number, fallback: number) {
   const n = Number.isFinite(value) ? Math.trunc(value) : fallback;
   return Math.max(min, Math.min(max, n));
+}
+
+/** Mensaje automático al usuario cuando la conversación queda asignada a un asesor (post flujo). */
+function buildPostAsignacionWelcomeMessage(nombreAgente: string): string {
+  return (
+    'Hola 👋, ¡espero que te encuentres muy bien!\n' +
+    `Hablas con ${nombreAgente}, con gusto te atenderé 😊.\n` +
+    'En este momento estamos recibiendo un alto volumen de mensajes, por lo que nuestra respuesta puede tardar un poco. Agradecemos mucho tu paciencia mientras te atendemos lo antes posible.'
+  );
 }
 

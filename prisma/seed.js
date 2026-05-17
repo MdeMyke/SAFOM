@@ -255,6 +255,233 @@ async function main() {
       });
     }
   }
+
+  await seedFlujoSoporteHorus(prisma);
+}
+
+/**
+ * Flujo WhatsApp soporte HORUS (estados + reglas).
+ * Idempotente: elimina y recrea el flujo `soporte_horus` si ya existía.
+ */
+async function seedFlujoSoporteHorus(prisma) {
+  const nombreFlujo = 'soporte_horus';
+  const existing = await prisma.flujo.findFirst({ where: { nombre: nombreFlujo } });
+  if (existing) {
+    await prisma.reglaFlujo.deleteMany({ where: { flujoId: existing.id } });
+    await prisma.estadoFlujo.deleteMany({ where: { flujoId: existing.id } });
+    await prisma.flujo.delete({ where: { id: existing.id } });
+  }
+
+  const flujo = await prisma.flujo.create({ data: { nombre: nombreFlujo } });
+
+  const nombresEstados = [
+    'inicio',
+    'tipo_identificacion',
+    'esperando_cedula',
+    'esperando_nit',
+    'tipo_usuario',
+    'menu_afiliado',
+    'menu_prestador',
+    'menu_externo',
+    'menu_empleado',
+    'esperando_asesor',
+    'finalizado',
+  ];
+
+  const estadoIdByNombre = new Map();
+  for (const nombre of nombresEstados) {
+    const row = await prisma.estadoFlujo.create({
+      data: { flujoId: flujo.id, nombreEstado: nombre },
+    });
+    estadoIdByNombre.set(nombre, row.id);
+  }
+
+  const idOf = (nombre) => {
+    const id = estadoIdByNombre.get(nombre);
+    if (!id) throw new Error(`Estado flujo no definido: ${nombre}`);
+    return id;
+  };
+
+  const motivoOpcionesAfiliado = {
+    '1': 'problema_acceso_horus',
+    '2': 'actualizar_contacto',
+    '3': 'info_radicado_afiliaciones',
+    '4': 'info_autorizaciones',
+    '5': 'problema_app_fomag',
+    '6': 'libre_eleccion',
+    '7': 'puntos_atencion',
+    '8': 'error_solicitud_radicado',
+    '9': 'como_colocar_pqrs',
+    '10': 'otros_tramites_fomag',
+  };
+
+  const motivoOpcionesPrestador = {
+    '1': 'problema_acceso_horus',
+    '2': 'solicitar_usuario_horus',
+    '3': 'sistema_lento_intermitente',
+    '4': 'info_capacitaciones',
+    '5': 'problema_rips_json',
+    '6': 'problema_soportes_atencion',
+    '7': 'soportes_administrativos',
+    '8': 'glosas_devoluciones',
+    '9': 'problema_transcripcion',
+    '10': 'otro_inconveniente',
+  };
+
+  const motivoOpcionesExternoEmpleado = {
+    '1': 'problema_acceso_horus',
+    '2': 'solicitar_usuario_horus',
+    '3': 'sistema_lento_intermitente',
+    '4': 'info_capacitaciones',
+    '5': 'problema_auditoria',
+    '6': 'problema_reportes',
+    '7': 'permiso_o_rol',
+    '8': 'problema_centro_regulador',
+    '9': 'problema_transcripcion',
+    '10': 'otro_inconveniente',
+  };
+
+  const reglas = [
+    {
+      estado: 'inicio',
+      tipoDisparador: 'cualquier_texto',
+      valorDisparador: '*',
+      textoRespuesta:
+        '👋 Bienvenido al soporte técnico de SUIM HORUS\n\nSeleccione el tipo de identificación:\n\n1️⃣ Cédula\n2️⃣ NIT',
+      siguiente: 'tipo_identificacion',
+    },
+    {
+      estado: 'tipo_identificacion',
+      tipoDisparador: 'texto',
+      valorDisparador: '1',
+      textoRespuesta: 'Digite su número de cédula\n\n(solo números)',
+      siguiente: 'esperando_cedula',
+      tipoAccion: 'merge_metadata',
+      payloadAccion: { tipo_documento: 'cedula' },
+    },
+    {
+      estado: 'tipo_identificacion',
+      tipoDisparador: 'texto',
+      valorDisparador: '2',
+      textoRespuesta: 'Digite su número de NIT\n\n(solo números)',
+      siguiente: 'esperando_nit',
+      tipoAccion: 'merge_metadata',
+      payloadAccion: { tipo_documento: 'nit' },
+    },
+    {
+      estado: 'esperando_cedula',
+      tipoDisparador: 'regex',
+      valorDisparador: '^[0-9]{5,20}$',
+      textoRespuesta:
+        'Seleccione el tipo de usuario:\n\n1️⃣ Afiliado\n2️⃣ Prestador\n3️⃣ Externo\n4️⃣ Empleado',
+      siguiente: 'tipo_usuario',
+    },
+    {
+      estado: 'esperando_nit',
+      tipoDisparador: 'regex',
+      valorDisparador: '^[0-9]{5,20}$',
+      textoRespuesta:
+        'Seleccione el tipo de usuario:\n\n1️⃣ Afiliado\n2️⃣ Prestador\n3️⃣ Externo\n4️⃣ Empleado',
+      siguiente: 'tipo_usuario',
+    },
+    {
+      estado: 'tipo_usuario',
+      tipoDisparador: 'texto',
+      valorDisparador: '1',
+      textoRespuesta:
+        'Seleccione la opción que mejor describa su solicitud:\n\n1️⃣ No puede ingresar a Horus\n2️⃣ Actualizar datos de contacto\n3️⃣ Información radicado afiliaciones\n4️⃣ Información autorizaciones\n5️⃣ Problemas APP FOMAG\n6️⃣ Libre elección\n7️⃣ Puntos de atención\n8️⃣ Error solicitud radicado\n9️⃣ Cómo colocar PQRS\n🔟 Otros trámites FOMAG',
+      siguiente: 'menu_afiliado',
+      tipoAccion: 'merge_metadata',
+      payloadAccion: { tipo_usuario: 'afiliado' },
+    },
+    {
+      estado: 'tipo_usuario',
+      tipoDisparador: 'texto',
+      valorDisparador: '2',
+      textoRespuesta:
+        'Seleccione la opción que mejor describa su solicitud:\n\n1️⃣ No puede ingresar a Horus\n2️⃣ Solicitar usuario Horus\n3️⃣ Sistema lento/intermitente\n4️⃣ Información capacitaciones\n5️⃣ Problema RIPS JSON\n6️⃣ Problema soportes atención\n7️⃣ Soportes administrativos\n8️⃣ Glosas y devoluciones\n9️⃣ Problema transcripción\n🔟 Otro inconveniente',
+      siguiente: 'menu_prestador',
+      tipoAccion: 'merge_metadata',
+      payloadAccion: { tipo_usuario: 'prestador' },
+    },
+    {
+      estado: 'tipo_usuario',
+      tipoDisparador: 'texto',
+      valorDisparador: '3',
+      textoRespuesta:
+        'Seleccione la opción que mejor describa su solicitud:\n\n1️⃣ No puede ingresar a Horus\n2️⃣ Solicitar usuario Horus\n3️⃣ Sistema lento/intermitente\n4️⃣ Información capacitaciones\n5️⃣ Problema auditoría\n6️⃣ Problema reportes\n7️⃣ Permiso o rol\n8️⃣ Problema centro regulador\n9️⃣ Problema transcripción\n🔟 Otro inconveniente',
+      siguiente: 'menu_externo',
+      tipoAccion: 'merge_metadata',
+      payloadAccion: { tipo_usuario: 'externo' },
+    },
+    {
+      estado: 'tipo_usuario',
+      tipoDisparador: 'texto',
+      valorDisparador: '4',
+      textoRespuesta:
+        'Seleccione la opción que mejor describa su solicitud:\n\n1️⃣ No puede ingresar a Horus\n2️⃣ Solicitar usuario Horus\n3️⃣ Sistema lento/intermitente\n4️⃣ Información capacitaciones\n5️⃣ Problema auditoría\n6️⃣ Problema reportes\n7️⃣ Permiso o rol\n8️⃣ Problema centro regulador\n9️⃣ Problema transcripción\n🔟 Otro inconveniente',
+      siguiente: 'menu_empleado',
+      tipoAccion: 'merge_metadata',
+      payloadAccion: { tipo_usuario: 'empleado' },
+    },
+    {
+      estado: 'menu_afiliado',
+      tipoDisparador: 'regex',
+      valorDisparador: '^(1|2|3|4|5|6|7|8|9|10)$',
+      textoRespuesta:
+        '✅ Tu solicitud fue registrada correctamente.\n\nUn asesor especializado atenderá tu caso lo antes posible.',
+      siguiente: 'esperando_asesor',
+      tipoAccion: 'merge_metadata',
+      payloadAccion: { motivoOpciones: motivoOpcionesAfiliado },
+    },
+    {
+      estado: 'menu_prestador',
+      tipoDisparador: 'regex',
+      valorDisparador: '^(1|2|3|4|5|6|7|8|9|10)$',
+      textoRespuesta:
+        '✅ Tu solicitud fue registrada correctamente.\n\nUn asesor especializado atenderá tu caso lo antes posible.',
+      siguiente: 'esperando_asesor',
+      tipoAccion: 'merge_metadata',
+      payloadAccion: { motivoOpciones: motivoOpcionesPrestador },
+    },
+    {
+      estado: 'menu_externo',
+      tipoDisparador: 'regex',
+      valorDisparador: '^(1|2|3|4|5|6|7|8|9|10)$',
+      textoRespuesta:
+        '✅ Tu solicitud fue registrada correctamente.\n\nUn asesor especializado atenderá tu caso lo antes posible.',
+      siguiente: 'esperando_asesor',
+      tipoAccion: 'merge_metadata',
+      payloadAccion: { motivoOpciones: motivoOpcionesExternoEmpleado },
+    },
+    {
+      estado: 'menu_empleado',
+      tipoDisparador: 'regex',
+      valorDisparador: '^(1|2|3|4|5|6|7|8|9|10)$',
+      textoRespuesta:
+        '✅ Tu solicitud fue registrada correctamente.\n\nUn asesor interno atenderá tu caso lo antes posible.',
+      siguiente: 'esperando_asesor',
+      tipoAccion: 'merge_metadata',
+      payloadAccion: { motivoOpciones: motivoOpcionesExternoEmpleado },
+    },
+  ];
+
+  for (const r of reglas) {
+    await prisma.reglaFlujo.create({
+      data: {
+        flujoId: flujo.id,
+        estadoActualId: idOf(r.estado),
+        tipoDisparador: r.tipoDisparador,
+        valorDisparador: r.valorDisparador,
+        textoRespuesta: r.textoRespuesta,
+        siguienteEstadoId: idOf(r.siguiente),
+        tipoAccion: r.tipoAccion ?? null,
+        payloadAccion: r.payloadAccion ?? undefined,
+      },
+    });
+  }
+
+  console.log(`[seed] Flujo "${nombreFlujo}" creado (${reglas.length} reglas, ${nombresEstados.length} estados).`);
 }
 
 main()

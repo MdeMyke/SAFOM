@@ -36,12 +36,27 @@ export class ChatbotController {
   }
 
   // =========================
+  // WEBHOOK Whapi (público)
+  // =========================
+
+  @Post('whapi/webhook')
+  @HttpCode(200)
+  async receiveWhapiWebhook(@Body() body: unknown) {
+    await this.chatbotService.receiveWhapiWebhook(body);
+    return { ok: true };
+  }
+
+  // =========================
   // API interna (protegida)
   // =========================
 
   @Get('chatbot/conversations')
   @UseGuards(JwtAuthGuard)
-  getConversations(@Req() req: Request, @Query('limit') limit?: string) {
+  getConversations(
+    @Req() req: Request,
+    @Query('limit') limit?: string,
+    @Query('tipo_usuario') tipoUsuario?: string,
+  ) {
     const user = req.user as RequestUser | undefined;
     if (!user?.id) {
       throw new UnauthorizedException('No autenticado');
@@ -49,6 +64,7 @@ export class ChatbotController {
     return this.chatbotService.getConversations({
       limit: Number(limit ?? 50),
       actorUserId: user.id,
+      tipoUsuario: tipoUsuario?.trim() || undefined,
     });
   }
 
