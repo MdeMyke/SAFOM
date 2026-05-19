@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 
 type VerifyWebhookQuery = Record<string, unknown>;
@@ -36,13 +36,58 @@ const CHATBOT_AUTO_ASSIGN_USER_ID =
 const ETIQUETA_CONVERSACION_ESCALADA = 'Escalado';
 const ETIQUETA_CONVERSACION_ESCALADA_COLOR = '#FED7AA';
 
+/** Estados en los que el bot ya no procesa mensajes automáticos. */
+const FLOW_TERMINAL_STATES = new Set(['flujo_finalizado', 'finalizado', 'esperando_asesor']);
+
+const FLOW_INACTIVITY_WARN_MS =
+  (Number(process.env.FLOW_INACTIVITY_WARN_MINUTES) > 0
+    ? Number(process.env.FLOW_INACTIVITY_WARN_MINUTES)
+    : 5) *
+  60 *
+  1000;
+
+const FLOW_INACTIVITY_CLOSE_MS =
+  (Number(process.env.FLOW_INACTIVITY_CLOSE_MINUTES) > 0
+    ? Number(process.env.FLOW_INACTIVITY_CLOSE_MINUTES)
+    : 7) *
+  60 *
+  1000;
+
+const FLOW_INACTIVITY_WARN_MESSAGE =
+  '⏱️ Llevamos un momento sin recibir tu respuesta.\n\n' +
+  'Si no continúas en los próximos 2 minutos, esta conversación se cerrará automáticamente.\n\n' +
+  'Por favor, responde para seguir con tu solicitud.';
+
+const FLOW_INACTIVITY_CLOSE_MESSAGE =
+  '⏱️ Tu sesión en el chatbot expiró por inactividad.\n\n' +
+  'Cuando desees, escribe de nuevo para iniciar una nueva solicitud.';
+
+const FLOW_INACTIVITY_SWEEP_MS =
+  Number(process.env.FLOW_INACTIVITY_SWEEP_MS) > 0 ? Number(process.env.FLOW_INACTIVITY_SWEEP_MS) : 60_000;
+
 @Injectable()
-export class ChatbotService {
+export class ChatbotService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(ChatbotService.name);
   private static warnedMissingWhatsAppEnv = false;
   private static warnedMissingWhapiEnv = false;
+  private flowInactivityInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor(private readonly prisma: PrismaService) {}
+
+  onModuleInit() {
+    this.flowInactivityInterval = setInterval(() => {
+      void this.sweepFlowInactivity().catch((err) => {
+        this.logger.error('Error en barrido de inactividad del flujo', err as Error);
+      });
+    }, FLOW_INACTIVITY_SWEEP_MS);
+  }
+
+  onModuleDestroy() {
+    if (this.flowInactivityInterval) {
+      clearInterval(this.flowInactivityInterval);
+      this.flowInactivityInterval = null;
+    }
+  }
 
   /**
    * Nota: mientras no se ejecute `prisma generate` después de cambiar `schema.prisma`,
@@ -1122,14 +1167,158 @@ export class ChatbotService {
       });
       return createdConversation;
     }
-    if (profileName != null && String(profileName).trim() !== '') {
+    const profileTrimmed = profileName != null ? String(profileName).trim() : '';
+    const existingNombre = latest.nombre != null ? String(latest.nombre).trim() : '';
+    if (profileTrimmed && !existingNombre) {
       await tx.conversacion.update({
         where: { id: latest.id },
-        data: { nombre: String(profileName).trim() },
+        data: { nombre: profileTrimmed },
       });
     }
 
     return { id: latest.id, estadoId: latest.estadoId };
+  }
+
+  /** Cierra la conversación abierta del número si el flujo del bot expiró por inactividad. */
+  private async expireBotFlowConversationIfNeeded(waId: string): Promise<void> {
+    const conversation = await this.findCurrentConversationForWaId(waId);
+    if (!conversation || this.isConversationClosedRow(conversation)) return;
+    if (!isActiveBotCollectionPhase(conversation)) return;
+
+    const lastUserMessageAt = await this.getLastUserMessageAt(conversation.id);
+    if (!lastUserMessageAt) return;
+
+    const inactiveMs = Date.now() - lastUserMessageAt.getTime();
+    if (inactiveMs < FLOW_INACTIVITY_CLOSE_MS) return;
+
+    await this.closeConversationForFlowInactivity({
+      conversation: {
+        id: conversation.id,
+        waId: conversation.waId,
+        estadoId: conversation.estadoId,
+        estado: conversation.estado ?? null,
+      },
+      sendFarewell: true,
+    });
+  }
+
+  private async getLastUserMessageAt(conversationId: number): Promise<Date | null> {
+    const row = await this.db.mensaje.findFirst({
+      where: { conversacionId: conversationId, enviadoPorMi: false },
+      orderBy: { createdAt: 'desc' },
+      select: { createdAt: true },
+    });
+    return row?.createdAt ?? null;
+  }
+
+  private async closeConversationForFlowInactivity(opts: {
+    conversation: {
+      id: number;
+      waId: string;
+      estadoId: number;
+      estado?: { nombre?: string | null } | null;
+    };
+    motivo?: string;
+    sendFarewell?: boolean;
+  }) {
+    if (this.isConversationClosedRow(opts.conversation)) return;
+
+    const cerrado = await this.db.estado.findFirst({
+      where: { nombre: 'cerrado' },
+      select: { id: true, nombre: true },
+    });
+    if (!cerrado) {
+      this.logger.warn('Estado "cerrado" no encontrado; no se puede cerrar por inactividad');
+      return;
+    }
+    if (opts.conversation.estadoId === cerrado.id) return;
+
+    const motivo = opts.motivo ?? 'Cierre automático por inactividad en el flujo del chatbot';
+
+    await this.db.$transaction(async (tx: any) => {
+      await tx.conversacion.update({
+        where: { id: opts.conversation.id },
+        data: { estadoId: cerrado.id },
+      });
+      await this.registerConversationStatusChangeTx(tx, {
+        conversacionId: opts.conversation.id,
+        estadoAnteriorId: opts.conversation.estadoId,
+        estadoNuevoId: cerrado.id,
+        estadoAnteriorNombre: opts.conversation.estado?.nombre ?? null,
+        estadoNuevoNombre: cerrado.nombre,
+        motivo,
+        actorUserId: CHATBOT_SYSTEM_USER_ID,
+      });
+    });
+
+    if (opts.sendFarewell !== false) {
+      await this.sendAndPersistOutgoing({
+        conversationId: opts.conversation.id,
+        waId: opts.conversation.waId,
+        text: FLOW_INACTIVITY_CLOSE_MESSAGE,
+        meta: { kind: 'flow_inactivity_close' },
+      });
+    }
+  }
+
+  private async sendFlowInactivityWarning(conversation: {
+    id: number;
+    waId: string;
+    metadata: unknown;
+  }) {
+    await this.sendAndPersistOutgoing({
+      conversationId: conversation.id,
+      waId: conversation.waId,
+      text: FLOW_INACTIVITY_WARN_MESSAGE,
+      meta: { kind: 'flow_inactivity_warn' },
+    });
+    await this.db.conversacion.update({
+      where: { id: conversation.id },
+      data: {
+        metadata: mergeInactivityWarned(conversation.metadata) as object,
+      },
+    });
+  }
+
+  private async sweepFlowInactivity() {
+    const rows = await this.db.conversacion.findMany({
+      where: { deletedAt: null, currentUserId: null },
+      include: { estado: { select: { id: true, nombre: true } } },
+      orderBy: { id: 'asc' },
+    });
+
+    const now = Date.now();
+
+    for (const conversation of rows) {
+      if (this.isConversationClosedRow(conversation)) continue;
+      if (!isActiveBotCollectionPhase(conversation)) continue;
+
+      const lastUserMessageAt = await this.getLastUserMessageAt(conversation.id);
+      if (!lastUserMessageAt) continue;
+
+      const inactiveMs = now - lastUserMessageAt.getTime();
+
+      if (inactiveMs >= FLOW_INACTIVITY_CLOSE_MS) {
+        await this.closeConversationForFlowInactivity({
+          conversation: {
+            id: conversation.id,
+            waId: conversation.waId,
+            estadoId: conversation.estadoId,
+            estado: conversation.estado ?? null,
+          },
+          sendFarewell: true,
+        });
+        continue;
+      }
+
+      if (inactiveMs >= FLOW_INACTIVITY_WARN_MS && !hasFlowInactivityWarning(conversation.metadata)) {
+        await this.sendFlowInactivityWarning({
+          id: conversation.id,
+          waId: conversation.waId,
+          metadata: conversation.metadata,
+        });
+      }
+    }
   }
 
   private async saveIncomingWhatsAppMessages(payload: any) {
@@ -1155,6 +1344,8 @@ export class ChatbotService {
           const meta = message ?? null;
 
           if (!waId || !externalId) continue;
+
+          await this.expireBotFlowConversationIfNeeded(waId);
 
           const conversation = await this.getOrCreateActiveConversationTx(
             this.db,
@@ -1227,6 +1418,8 @@ export class ChatbotService {
 
       const idExterno = String(externalId ?? '').trim() || `whapi-in-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
+      await this.expireBotFlowConversationIfNeeded(waId);
+
       const conversation = await this.getOrCreateActiveConversationTx(
         this.db,
         waId,
@@ -1280,12 +1473,21 @@ export class ChatbotService {
 
       const current = await this.db.conversacion.findUnique({
         where: { id: opts.conversationId },
-        select: { id: true, estadoFlujo: true, cedula: true, telefono: true, metadata: true },
+        select: {
+          id: true,
+          estadoFlujo: true,
+          cedula: true,
+          telefono: true,
+          metadata: true,
+          currentUserId: true,
+        },
       });
       if (!current) return;
 
       let fromState = String(current.estadoFlujo || 'inicio').trim() || 'inicio';
       if (fromState === 'INIT') fromState = 'inicio';
+
+      if (isTerminalBotFlowState(fromState)) return;
 
       const estadoActual = await this.db.estadoFlujo.findFirst({
         where: { flujoId: flujo.id, nombreEstado: fromState },
@@ -1310,11 +1512,14 @@ export class ChatbotService {
         if (digits.length >= 5) metaPatch.numero_documento = digits;
       }
 
-      const mergedMeta = mergeConversationMetadata(current.metadata, metaPatch);
+      const mergedMeta = clearInactivityWarned(
+        mergeConversationMetadata(current.metadata, metaPatch),
+      );
 
       const update: {
         cedula?: string;
         telefono?: string;
+        nombre?: string;
         estadoFlujo?: string;
         metadata?: Record<string, unknown>;
         currentUserId?: number | null;
@@ -1322,6 +1527,11 @@ export class ChatbotService {
         estadoFlujo: nextNombreEstado,
         metadata: mergedMeta,
       };
+
+      if (fromState === 'esperando_nombre') {
+        const nombre = opts.incomingText.trim().replace(/\s+/g, ' ');
+        if (nombre.length >= 3) update.nombre = nombre;
+      }
 
       if (nextNombreEstado === 'esperando_asesor') {
         update.currentUserId = CHATBOT_AUTO_ASSIGN_USER_ID;
@@ -1366,6 +1576,11 @@ export class ChatbotService {
           waId: opts.waId,
           text: textoBienvenida,
           meta: { kind: 'post_asignacion_agente', agente_user_id: CHATBOT_AUTO_ASSIGN_USER_ID },
+        });
+
+        await this.db.conversacion.update({
+          where: { id: opts.conversationId },
+          data: { estadoFlujo: 'flujo_finalizado' },
         });
       }
     } catch (err) {
@@ -1590,6 +1805,40 @@ function mergeConversationMetadata(prev: unknown, patch: Record<string, unknown>
   const base =
     prev && typeof prev === 'object' && !Array.isArray(prev) ? { ...(prev as Record<string, unknown>) } : {};
   return { ...base, ...patch };
+}
+
+function isTerminalBotFlowState(estadoFlujo?: string | null): boolean {
+  const state = String(estadoFlujo ?? '').trim();
+  return FLOW_TERMINAL_STATES.has(state);
+}
+
+function isActiveBotCollectionPhase(conversation: {
+  estadoFlujo?: string | null;
+  currentUserId?: number | null;
+}): boolean {
+  if (conversation.currentUserId != null) return false;
+  return !isTerminalBotFlowState(conversation.estadoFlujo);
+}
+
+function hasFlowInactivityWarning(metadata: unknown): boolean {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return false;
+  const warnedAt = (metadata as Record<string, unknown>).flow_inactivity_warned_at;
+  return warnedAt != null && String(warnedAt).trim() !== '';
+}
+
+function mergeInactivityWarned(metadata: unknown): Record<string, unknown> {
+  return mergeConversationMetadata(metadata, {
+    flow_inactivity_warned_at: new Date().toISOString(),
+  });
+}
+
+function clearInactivityWarned(metadata: unknown): Record<string, unknown> {
+  const next =
+    metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+      ? { ...(metadata as Record<string, unknown>) }
+      : {};
+  delete next.flow_inactivity_warned_at;
+  return next;
 }
 
 function buildMetadataPatchFromRule(

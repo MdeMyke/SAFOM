@@ -279,14 +279,26 @@ async function seedFlujoSoporteHorus(prisma) {
     'tipo_identificacion',
     'esperando_cedula',
     'esperando_nit',
+    'esperando_nombre',
     'tipo_usuario',
     'menu_afiliado',
     'menu_prestador',
     'menu_externo',
     'menu_empleado',
     'esperando_asesor',
-    'finalizado',
+    'flujo_finalizado',
   ];
+
+  const menuTipoUsuario =
+    'Seleccione el tipo de usuario:\n\n1️⃣ Afiliado\n2️⃣ Prestador\n3️⃣ Externo\n4️⃣ Empleado';
+
+  const reglaInvalida = (estado, textoRespuesta) => ({
+    estado,
+    tipoDisparador: 'default',
+    valorDisparador: null,
+    textoRespuesta,
+    siguiente: estado,
+  });
 
   const estadoIdByNombre = new Map();
   for (const nombre of nombresEstados) {
@@ -372,18 +384,39 @@ async function seedFlujoSoporteHorus(prisma) {
       estado: 'esperando_cedula',
       tipoDisparador: 'regex',
       valorDisparador: '^[0-9]{5,20}$',
-      textoRespuesta:
-        'Seleccione el tipo de usuario:\n\n1️⃣ Afiliado\n2️⃣ Prestador\n3️⃣ Externo\n4️⃣ Empleado',
-      siguiente: 'tipo_usuario',
+      textoRespuesta: 'Digite su nombre completo\n\n(solo letras, mínimo 3 caracteres)',
+      siguiente: 'esperando_nombre',
     },
+    reglaInvalida(
+      'esperando_cedula',
+      '❌ Número no válido. Digite solo números de cédula (entre 5 y 20 dígitos).\n\nEjemplo: 1234567890',
+    ),
     {
       estado: 'esperando_nit',
       tipoDisparador: 'regex',
       valorDisparador: '^[0-9]{5,20}$',
-      textoRespuesta:
-        'Seleccione el tipo de usuario:\n\n1️⃣ Afiliado\n2️⃣ Prestador\n3️⃣ Externo\n4️⃣ Empleado',
+      textoRespuesta: 'Digite su nombre completo\n\n(solo letras, mínimo 3 caracteres)',
+      siguiente: 'esperando_nombre',
+    },
+    reglaInvalida(
+      'esperando_nit',
+      '❌ Número no válido. Digite solo números de NIT (entre 5 y 20 dígitos).\n\nEjemplo: 900123456',
+    ),
+    {
+      estado: 'esperando_nombre',
+      tipoDisparador: 'regex',
+      valorDisparador: "^[a-zA-ZáéíóúÁÉÍÓÚñÑüÜ\\s.'-]{3,80}$",
+      textoRespuesta: menuTipoUsuario,
       siguiente: 'tipo_usuario',
     },
+    reglaInvalida(
+      'esperando_nombre',
+      '❌ Nombre no válido. Digite su nombre completo (mínimo 3 letras, sin números).',
+    ),
+    reglaInvalida(
+      'tipo_identificacion',
+      '❌ Opción no válida. Responda solo con el número:\n\n1 — Cédula\n2 — NIT',
+    ),
     {
       estado: 'tipo_usuario',
       tipoDisparador: 'texto',
@@ -424,6 +457,10 @@ async function seedFlujoSoporteHorus(prisma) {
       tipoAccion: 'merge_metadata',
       payloadAccion: { tipo_usuario: 'empleado' },
     },
+    reglaInvalida(
+      'tipo_usuario',
+      '❌ Opción no válida. Responda solo con el número:\n\n1 — Afiliado\n2 — Prestador\n3 — Externo\n4 — Empleado',
+    ),
     {
       estado: 'menu_afiliado',
       tipoDisparador: 'regex',
@@ -434,6 +471,10 @@ async function seedFlujoSoporteHorus(prisma) {
       tipoAccion: 'merge_metadata',
       payloadAccion: { motivoOpciones: motivoOpcionesAfiliado },
     },
+    reglaInvalida(
+      'menu_afiliado',
+      '❌ Opción no válida. Responda con un número del 1 al 10 según el menú anterior.',
+    ),
     {
       estado: 'menu_prestador',
       tipoDisparador: 'regex',
@@ -444,6 +485,10 @@ async function seedFlujoSoporteHorus(prisma) {
       tipoAccion: 'merge_metadata',
       payloadAccion: { motivoOpciones: motivoOpcionesPrestador },
     },
+    reglaInvalida(
+      'menu_prestador',
+      '❌ Opción no válida. Responda con un número del 1 al 10 según el menú anterior.',
+    ),
     {
       estado: 'menu_externo',
       tipoDisparador: 'regex',
@@ -454,6 +499,10 @@ async function seedFlujoSoporteHorus(prisma) {
       tipoAccion: 'merge_metadata',
       payloadAccion: { motivoOpciones: motivoOpcionesExternoEmpleado },
     },
+    reglaInvalida(
+      'menu_externo',
+      '❌ Opción no válida. Responda con un número del 1 al 10 según el menú anterior.',
+    ),
     {
       estado: 'menu_empleado',
       tipoDisparador: 'regex',
@@ -464,6 +513,10 @@ async function seedFlujoSoporteHorus(prisma) {
       tipoAccion: 'merge_metadata',
       payloadAccion: { motivoOpciones: motivoOpcionesExternoEmpleado },
     },
+    reglaInvalida(
+      'menu_empleado',
+      '❌ Opción no válida. Responda con un número del 1 al 10 según el menú anterior.',
+    ),
   ];
 
   for (const r of reglas) {
