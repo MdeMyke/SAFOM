@@ -13,7 +13,7 @@ model User {
   nombre           String
   correo           String     @unique
   password         String
-  isOnline         Boolean    @default(true) @map("is_online") @db.TinyInt
+  isOnline         Boolean    @default(false) @map("is_online") @db.TinyInt
   telefono         String?
   lastLoginAt      DateTime?  @map("last_login_at")
   passwordChangeAt DateTime?  @map("password_change_at")

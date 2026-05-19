@@ -84,6 +84,20 @@ export class ChatbotController {
     return this.chatbotService.reply(body, user.id);
   }
 
+  @Post('chatbot/conversations/iniciar')
+  @UseGuards(JwtAuthGuard)
+  startConversation(@Req() req: Request, @Body() body: { waId?: string; text?: string }) {
+    const user = req.user as RequestUser | undefined;
+    if (!user?.id) {
+      throw new UnauthorizedException('No autenticado');
+    }
+    return this.chatbotService.startConversation({
+      waId: body?.waId,
+      text: body?.text,
+      actorUserId: user.id,
+    });
+  }
+
   @Post('chatbot/conversations/:waId/status')
   @UseGuards(JwtAuthGuard)
   updateConversationStatus(

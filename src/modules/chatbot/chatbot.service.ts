@@ -323,6 +323,173 @@ export class ChatbotService implements OnModuleInit, OnModuleDestroy {
     return { ok: true, api: apiJson };
   }
 
+  /**
+   * Inicia una conversación saliente desde el inbox: crea/actualiza la fila en BD,
+   * asigna al agente, deja el flujo en `flujo_finalizado`, estado `en_progreso` y envía el primer mensaje.
+   */
+  async startConversation(opts: { waId?: string; text?: string; actorUserId: number }) {
+    const waId = normalizeWaIdDigits(opts.waId);
+    const text = String(opts.text ?? '').trim();
+    const actorUserId = Number(opts.actorUserId ?? 0);
+
+    if (!waId || waId.length < 10 || waId.length > 15) {
+      throw new BadRequestException('Número de WhatsApp no válido (use prefijo país + número, solo dígitos)');
+    }
+    if (!text) {
+      throw new BadRequestException('Se requiere el mensaje inicial');
+    }
+    if (!actorUserId || actorUserId < 1) {
+      throw new BadRequestException('Usuario no válido');
+    }
+
+    const actor = await this.db.user.findFirst({
+      where: { id: actorUserId, deletedAt: null },
+      select: { id: true, nombre: true },
+    });
+    if (!actor) throw new BadRequestException('Usuario no encontrado');
+
+    const apiJson = await this.sendWhatsAppText({ toWaId: waId, text });
+    const externalId =
+      (apiJson as any)?.messages?.[0]?.id ??
+      `local-out-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+    const metadataInicio = {
+      iniciada_por_agente: true,
+      iniciada_por_user_id: actorUserId,
+      iniciada_en: new Date().toISOString(),
+    };
+
+    let conversationId = 0;
+    let previousEstadoId: number | null = null;
+    let previousEstadoNombre: string | null = null;
+
+    await this.prisma.$transaction(async (tx: any) => {
+      const rows = await tx.conversacion.findMany({
+        where: { waId, deletedAt: null },
+        orderBy: { id: 'desc' },
+        include: { estado: { select: { id: true, nombre: true } } },
+      });
+      const latest = rows[0] ?? null;
+      const useExistingOpen = latest != null && !this.isConversationClosedRow(latest);
+
+      if (useExistingOpen) {
+        conversationId = latest.id;
+        previousEstadoId = latest.estadoId;
+        previousEstadoNombre = latest.estado?.nombre ?? null;
+
+        await tx.conversacion.update({
+          where: { id: latest.id },
+          data: {
+            estadoId: ESTADO_CONVERSACION_EN_PROGRESO_ID,
+            estadoFlujo: 'flujo_finalizado',
+            currentUserId: actorUserId,
+            telefono: waId,
+            metadata: mergeConversationMetadata(latest.metadata, metadataInicio) as object,
+          },
+        });
+      } else {
+        const created = await tx.conversacion.create({
+          data: {
+            waId,
+            estadoId: ESTADO_CONVERSACION_EN_PROGRESO_ID,
+            estadoFlujo: 'flujo_finalizado',
+            currentUserId: actorUserId,
+            telefono: waId,
+            metadata: metadataInicio as object,
+          },
+          select: { id: true, estadoId: true },
+        });
+        conversationId = created.id;
+        previousEstadoId = null;
+        previousEstadoNombre = null;
+
+        await this.registerConversationOpenedTx(tx, {
+          conversacionId: created.id,
+          motivo: 'Conversación iniciada por agente desde inbox',
+          actorUserId,
+          estadoId: ESTADO_CONVERSACION_EN_PROGRESO_ID,
+          estadoNombre: 'en_progreso',
+        });
+      }
+
+      if (
+        useExistingOpen &&
+        previousEstadoId != null &&
+        previousEstadoId !== ESTADO_CONVERSACION_EN_PROGRESO_ID
+      ) {
+        await this.registerConversationStatusChangeTx(tx, {
+          conversacionId: conversationId,
+          estadoAnteriorId: previousEstadoId,
+          estadoNuevoId: ESTADO_CONVERSACION_EN_PROGRESO_ID,
+          estadoAnteriorNombre: previousEstadoNombre,
+          estadoNuevoNombre: 'en_progreso',
+          motivo: 'Conversación iniciada por agente desde inbox',
+          actorUserId,
+        });
+      }
+
+      await tx.asignacionConversacion.updateMany({
+        where: { conversacionId: conversationId, isActive: true },
+        data: {
+          isActive: false,
+          unassignedAt: new Date(),
+          unassignedBy: actorUserId,
+        },
+      });
+
+      await tx.asignacionConversacion.create({
+        data: {
+          conversacionId: conversationId,
+          userId: actorUserId,
+          assignedBy: actorUserId,
+          isActive: true,
+          assignedAt: new Date(),
+        },
+      });
+
+      await this.createConversationHistoryTx(tx, {
+        conversacionId: conversationId,
+        accion: 'INICIAR_CONVERSACION',
+        descripcion: `Conversación iniciada por ${actor.nombre}`,
+        valorNuevo: {
+          wa_id: waId,
+          estado_flujo: 'flujo_finalizado',
+          estado: 'en_progreso',
+          current_user_id: actorUserId,
+        },
+        actorUserId,
+      });
+
+      await tx.mensaje.create({
+        data: {
+          conversacionId: conversationId,
+          idExterno: String(externalId),
+          enviadoPorMi: true,
+          tipo: 'text',
+          contenido: text,
+          meta: {
+            outgoing: true,
+            api: apiJson,
+            source: 'inbox_iniciar_conversacion',
+            agentUserId: actorUserId,
+          } as object,
+        },
+      });
+    });
+
+    return {
+      ok: true,
+      conversation_id: conversationId,
+      wa_id: waId,
+      current_user_id: actor.id,
+      current_user_name: actor.nombre,
+      status: 'en_progreso',
+      estado_flujo: 'flujo_finalizado',
+      last_content: text,
+      api: apiJson,
+    };
+  }
+
   async updateConversationStatus(opts: { waId: string; status?: string; motivo?: string; actorUserId: number }) {
     const waId = String(opts.waId ?? '').trim();
     const actorUserId = Number(opts.actorUserId ?? 0);
@@ -1085,6 +1252,8 @@ export class ChatbotService implements OnModuleInit, OnModuleDestroy {
       conversacionId: number;
       motivo: string;
       actorUserId: number;
+      estadoId?: number;
+      estadoNombre?: string;
     },
   ) {
     await this.createConversationHistoryTx(tx, {
@@ -1092,8 +1261,8 @@ export class ChatbotService implements OnModuleInit, OnModuleDestroy {
       accion: 'CAMBIO_ESTADO',
       descripcion: opts.motivo,
       valorNuevo: {
-        estado_id: ESTADO_CONVERSACION_ABIERTO_ID,
-        estado: 'abierto',
+        estado_id: opts.estadoId ?? ESTADO_CONVERSACION_ABIERTO_ID,
+        estado: opts.estadoNombre ?? 'abierto',
       },
       actorUserId: opts.actorUserId,
     });
@@ -1885,6 +2054,10 @@ function normalizeStatusName(value?: string) {
 
 function extractDigits(text: string) {
   return String(text ?? '').replace(/\D/g, '');
+}
+
+function normalizeWaIdDigits(value?: string | null): string {
+  return extractDigits(String(value ?? ''));
 }
 
 function isSameUtcDate(a: Date, b: Date) {

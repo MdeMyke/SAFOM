@@ -108,6 +108,7 @@ export class UsersService {
           correo: dto.correo.trim().toLowerCase(),
           telefono: dto.telefono ?? null,
           password: passwordHash,
+          isOnline: false,
           passwordChangeAt: new Date(),
           roles: {
             create: roleIds.map((roleId) => ({
